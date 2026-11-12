@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Audio Journal</title>
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Journal">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon-192.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="top" class="top">
+    <header class="nav">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <span>journal</span>
+      </div>
+      <div class="nav-right">
+        <span id="summary" class="summary"></span>
+        <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings"></button>
+      </div>
+    </header>
+    <div id="banner" class="banner" hidden></div>
+    <div class="searchbar">
+      <span class="search-icon"></span>
+      <input id="search" type="search" placeholder="Search titles, notes, tags, dates…" autocomplete="off" enterkeyhint="search">
+    </div>
+    <div id="filters" class="filters"></div>
+  </div>
+
+  <main id="list" class="list"></main>
+
+  <div id="rail" class="rail" hidden>
+    <div id="rail-ticks" class="rail-ticks"></div>
+    <div id="rail-thumb" class="rail-thumb"></div>
+    <div id="rail-bubble" class="rail-bubble" hidden></div>
+  </div>
+
+  <button id="rec-btn" class="fab" type="button" aria-label="Record"></button>
+
+  <section id="screen-record" class="screen" hidden></section>
+  <section id="screen-detail" class="screen" hidden></section>
+  <section id="screen-settings" class="screen" hidden></section>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script type="module" src="app.js"></script>
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+    }
+  </script>
+</body>
+</html>
