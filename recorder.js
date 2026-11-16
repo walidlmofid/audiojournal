@@ -26,6 +26,19 @@ export function extFor(mime) {
 
 const CHUNK_MS = 5000;
 
+// The microphones the phone offers (its own mic, headphones, Bluetooth...).
+// Their names are only visible once the microphone has been allowed.
+export async function listMics() {
+  const inputs = async () => (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput");
+  let list = await inputs();
+  if (!list.some(d => d.label)) {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach(t => t.stop());
+    list = await inputs();
+  }
+  return list.filter(d => d.deviceId && d.deviceId !== "default" && d.deviceId !== "communications");
+}
+
 export class Recorder {
   constructor({ onChunk, onEnd }) {
     this.onChunk = onChunk;
@@ -33,11 +46,20 @@ export class Recorder {
     this.level = 0;
   }
 
-  async start() {
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      // Plain sound like a voice recorder app, without call-style processing.
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    });
+  // micId: the microphone chosen in Settings, or nothing to let the phone decide.
+  async start(micId) {
+    // Plain sound like a voice recorder app, without call-style processing.
+    const plain = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+    this.fellBack = false;
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: micId ? { ...plain, deviceId: { exact: micId } } : plain });
+    } catch (err) {
+      // The chosen microphone is gone (unplugged...): record with whatever there is.
+      if (!micId || !["OverconstrainedError", "NotFoundError"].includes(err.name)) throw err;
+      this.fellBack = true;
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: plain });
+    }
+    this.micLabel = this.stream.getAudioTracks()[0]?.label || "";
     const mime = supportedFormats()[0];
     const opts = { audioBitsPerSecond: 128000 };
     if (mime) opts.mimeType = mime;

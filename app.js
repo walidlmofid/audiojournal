@@ -1,9 +1,9 @@
 import { h, $, uid, fmtClock, fmtLength, dayKey, fmtTime, fmtDay, fmtDayShort, fmtISODate, todayISO, fmtBytes, fold, icons } from "./util.js";
 import * as db from "./db.js";
-import { Recorder, supportedFormats } from "./recorder.js";
+import { Recorder, supportedFormats, listMics } from "./recorder.js";
 import { Tags, upgradeTags } from "./tags.js";
 
-const APP_VERSION = "0.2.0";
+const APP_VERSION = "0.3.0";
 
 // A recording looks like this:
 //   marks  : [{ t, tag }]  parts — "B" or "I" from second t until the next mark
@@ -17,6 +17,7 @@ const state = {
   filter: { q: "", ids: [], untagged: false, locked: false },
   groups: [],          // what the list currently shows, grouped by day
   recording: null,     // the recording in progress, if any
+  mic: null,           // the microphone chosen in Settings: { deviceId, label }
 };
 
 const round1 = x => Math.round(x * 10) / 10;
@@ -895,7 +896,7 @@ async function startRecording() {
   session.recorder = recorder;
 
   try {
-    await recorder.start();
+    await recorder.start(state.mic?.deviceId);
   } catch (err) {
     toast(err.name === "NotAllowedError"
       ? "Microphone blocked. Allow it in Chrome: ⋮ → Settings → Site settings → Microphone."
@@ -915,6 +916,7 @@ async function startRecording() {
   state.recording = session;
   navigator.storage?.persist?.().catch(() => {});
   keepAwake(session);
+  if (recorder.fellBack) toast(`“${micName(state.mic.label)}” isn't available, so another microphone is used.`, 6000);
 
   session.overlay = openScreen("record", el => {
     const timer = h("div", { class: "rec-timer" }, "0:00");
@@ -949,7 +951,8 @@ async function startRecording() {
     el.append(
       screenHeader("New recording", null),
       h("div", { class: "screen-body rec-body" },
-        h("div", { class: "rec-top" }, status, timer, meter),
+        h("div", { class: "rec-top" }, status, timer, meter,
+          recorder.micLabel ? h("div", { class: "rec-mic" }, "Mic: " + micName(recorder.micLabel)) : null),
         errBox,
         pad.el,
         h("h4", { class: "section-title" }, "Marked so far"),
@@ -1178,6 +1181,37 @@ async function importFiles(fileList) {
 /* Settings                                                            */
 /* ------------------------------------------------------------------ */
 
+// Chrome on Android calls the phone's own microphone "Speakerphone".
+function micName(label) {
+  if (!label) return "Unnamed microphone";
+  return /speakerphone/i.test(label) ? `Phone's own mic (${label})` : label;
+}
+
+function chooseMic(rerender) {
+  if (db.isReadOnly()) return;
+  listMics().then(mics => {
+    openSheet((s, close) => {
+      const pick = async mic => {
+        const row = { key: "mic", deviceId: mic?.deviceId || null, label: mic?.label || "" };
+        try { await db.put("meta", row); } catch (err) { toast("Could not save: " + err.message); return; }
+        state.mic = row.deviceId ? row : null;
+        close();
+        rerender();
+      };
+      const option = (text, on, onclick) => h("button", { class: "opt-row" + (on ? " on" : ""), type: "button", onclick }, text);
+      fill(s,
+        h("h3", {}, "Which microphone?"),
+        h("p", { class: "muted small" }, "Headphones only show here while they are connected."),
+        h("div", { class: "sheet-actions col" },
+          option("Automatic — the phone decides", !state.mic, () => pick(null)),
+          mics.map(m => option(micName(m.label), state.mic?.deviceId === m.deviceId, () => pick(m))),
+          btn("Cancel", close)));
+    });
+  }).catch(err => toast(err.name === "NotAllowedError"
+    ? "Microphone blocked. Allow it in Chrome: ⋮ → Settings → Site settings → Microphone."
+    : "Can't list the microphones: " + err.message, 6000));
+}
+
 const usesAny = (r, ids) =>
   (r.marks || []).some(m => ids.has(m.tag)) || (r.points || []).some(p => ids.has(p.tag)) ||
   (r.topics || []).some(i => ids.has(i)) || (r.labels || []).some(i => ids.has(i));
@@ -1187,6 +1221,12 @@ function openSettings() {
     const tagsBox = h("div", { class: "tag-editor" });
     const oldBox = h("div");
     const storageBox = h("div", { class: "muted small" }, "…");
+    const micBox = h("div");
+    const renderMic = () => micBox.replaceChildren(
+      h("p", { class: "muted small" }, state.mic
+        ? `Always record with: ${micName(state.mic.label)} — even when headphones are connected.`
+        : "Automatic: the phone decides. With headphones connected, it may use their microphone."),
+      btn("Choose microphone…", () => chooseMic(renderMic), "wide"));
     const count = ids => state.recs.filter(r => usesAny(r, ids)).length || "";
 
     const renderTags = () => {
@@ -1212,6 +1252,8 @@ function openSettings() {
         h("p", { class: "muted small" }, "Tap a tag to rename or delete it. The number is how many recordings use it."),
         tagsBox,
         oldBox,
+        h("h4", { class: "section-title" }, "Microphone"),
+        micBox,
         h("h4", { class: "section-title" }, "Import old recordings"),
         h("p", { class: "muted small" }, "Pick audio files from the phone (for example the Voice Recorder folder) — you can select them all at once. The date and time are read from the file name; what you wrote after it becomes the title. Files already imported are skipped."),
         btn("Choose files…", () => $("#import-input").click(), "wide primary"),
@@ -1223,6 +1265,7 @@ function openSettings() {
         h("p", { class: "muted small" },
           `Version ${APP_VERSION}. New recordings are saved as ${fmts[0] || "(recording not supported in this browser)"}.`)));
     renderTags();
+    renderMic();
     showStorage(storageBox);
   }, { onClose: renderAll });
 }
@@ -1326,6 +1369,8 @@ async function init() {
       }
     }
     state.tags.set(tags);
+    const mic = await db.get("meta", "mic");
+    state.mic = mic?.deviceId ? mic : null;
     state.recs = await db.getAll("recordings");
     await recoverInterrupted();
   } catch (err) {

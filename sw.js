@@ -11,7 +11,9 @@ self.addEventListener("fetch", e => {
   const req = e.request;
   if (req.method !== "GET" || new URL(req.url).origin !== location.origin) return;
 
-  const network = fetch(req).then(res => {
+  // "no-cache" = always ask the server whether the file changed, so an update
+  // never mixes old and new files.
+  const network = fetch(req, { cache: "no-cache" }).then(res => {
     if (res.ok) {
       const copy = res.clone();
       caches.open(CACHE).then(cache => cache.put(req, copy));
