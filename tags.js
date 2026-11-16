@@ -1,19 +1,45 @@
-// Topics form a tree (Mindset > willpower...). Labels are a flat list
-// (listen_to_this_everyday, future_predictions...).
+// Two kinds of things can be put on a recording's timeline:
+//   parts  : "B" and "I" (kind "topic"). A part runs until the next part starts.
+//   tags   : words you write yourself (kind "label"). A tag is one point in time.
+//
+// The first version of the app had a tree of topics. Topics made back then
+// still work: a sub-topic counts as part of the B / I it sits under.
 
 import { uid } from "./util.js";
 
-export const COLORS = ["#5cb8ff", "#ffb020", "#b78cff", "#4ade80", "#ff7ab6", "#2dd4bf", "#f2f2f2", "#ff8a5c"];
+export const PARTS = [
+  { name: "B", was: "Business", color: "#ff9a9a" },
+  { name: "I", was: "Mindset", color: "#7cc4ff" },
+];
 
-export function seedTags() {
+const STARTER_TAGS = ["just_chatting", "predictions", "listen_to_this_every_once_in_a_while"];
+
+// Makes sure B and I exist with their colours (renaming the first version's
+// "Business" / "Mindset"). Adds to `list` and returns what must be saved.
+export function upgradeTags(list) {
   const now = Date.now();
-  const topic = (name, color, i) => ({ id: uid() + i, kind: "topic", name, parentId: null, color, order: i, createdAt: now });
-  const label = (name, i) => ({ id: uid() + "l" + i, kind: "label", name, parentId: null, order: i, createdAt: now });
-  return [
-    topic("Mindset", COLORS[0], 0),
-    topic("Business", COLORS[1], 1),
-    ...["listen_to_this_everyday", "future_predictions", "just_chatting", "to_do", "important"].map(label),
-  ];
+  const changed = [];
+  const fresh = !list.length;
+  const roots = list.filter(t => t.kind === "topic" && !t.parentId);
+  PARTS.forEach((p, i) => {
+    const t = roots.find(r => r.name === p.name) || roots.find(r => r.name === p.was);
+    if (!t) {
+      const made = { id: uid() + i, kind: "topic", name: p.name, parentId: null, color: p.color, order: i, createdAt: now };
+      list.push(made);
+      changed.push(made);
+    } else if (t.name !== p.name || t.color !== p.color || t.order !== i) {
+      t.name = p.name; t.color = p.color; t.order = i;
+      changed.push(t);
+    }
+  });
+  if (fresh) {
+    STARTER_TAGS.forEach((name, i) => {
+      const made = { id: uid() + "l" + i, kind: "label", name, parentId: null, order: i, createdAt: now };
+      list.push(made);
+      changed.push(made);
+    });
+  }
+  return changed;
 }
 
 const byOrder = (a, b) => (a.order ?? 0) - (b.order ?? 0) || a.name.localeCompare(b.name);
@@ -28,11 +54,19 @@ export class Tags {
 
   get(id) { return this.byId.get(id); }
 
-  roots() { return this.list.filter(t => t.kind === "topic" && !t.parentId).sort(byOrder); }
+  isPart(id) { return this.get(id)?.kind === "topic"; }
 
-  children(id) { return this.list.filter(t => t.kind === "topic" && t.parentId === id).sort(byOrder); }
+  // The part buttons: B and I.
+  parts() { return this.list.filter(t => t.kind === "topic" && !t.parentId).sort(byOrder); }
 
-  labels() { return this.list.filter(t => t.kind === "label").sort(byOrder); }
+  // The tags you wrote.
+  tags() { return this.list.filter(t => t.kind === "label").sort(byOrder); }
+
+  // Topics left over from the first version (anything that isn't B or I).
+  oldTopics() {
+    const names = new Set(PARTS.map(p => p.name));
+    return this.list.filter(t => t.kind === "topic" && (t.parentId || !names.has(t.name))).sort(byOrder);
+  }
 
   path(id) {
     const out = [];
@@ -41,31 +75,20 @@ export class Tags {
     return out;
   }
 
-  pathName(id) {
+  root(id) { return this.path(id)[0]; }
+
+  name(id) {
     const p = this.path(id);
-    return p.length ? p.map(t => t.name).join(" › ") : "(deleted topic)";
+    return p.length ? p.map(t => t.name).join(" › ") : "(deleted)";
   }
 
-  name(id) { return this.get(id)?.name ?? "(deleted)"; }
-
-  color(id) {
-    const p = this.path(id);
-    return p[0]?.color || "#888";
-  }
+  color(id) { return this.root(id)?.color || "#9a9a9a"; }
 
   // The tag and everything under it.
   descendants(id) {
     const out = new Set([id]);
-    const walk = pid => { for (const c of this.children(pid)) { out.add(c.id); walk(c.id); } };
+    const walk = pid => { for (const t of this.list) if (t.parentId === pid && !out.has(t.id)) { out.add(t.id); walk(t.id); } };
     walk(id);
-    return out;
-  }
-
-  // Tree in display order: [{tag, depth}]
-  flatTree() {
-    const out = [];
-    const walk = (list, depth) => { for (const t of list) { out.push({ tag: t, depth }); walk(this.children(t.id), depth + 1); } };
-    walk(this.roots(), 0);
     return out;
   }
 }

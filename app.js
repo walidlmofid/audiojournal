@@ -1,21 +1,28 @@
 import { h, $, uid, fmtClock, fmtLength, dayKey, fmtTime, fmtDay, fmtDayShort, fmtISODate, todayISO, fmtBytes, fold, icons } from "./util.js";
 import * as db from "./db.js";
 import { Recorder, supportedFormats } from "./recorder.js";
-import { Tags, seedTags, COLORS } from "./tags.js";
+import { Tags, upgradeTags } from "./tags.js";
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.2.0";
+
+// A recording looks like this:
+//   marks  : [{ t, tag }]  parts — "B" or "I" from second t until the next mark
+//   points : [{ t, tag }]  tags — a single point at second t
+// (topics / labels are whole-recording tags from the first version; they are
+//  still shown and searched, and can be removed in edit mode.)
 
 const state = {
   recs: [],            // every recording (info only; the audio is loaded when played)
   tags: new Tags(),
-  filter: { q: "", tags: [], labels: [], untagged: false, locked: false },
+  filter: { q: "", ids: [], untagged: false, locked: false },
   groups: [],          // what the list currently shows, grouped by day
   recording: null,     // the recording in progress, if any
 };
 
 const round1 = x => Math.round(x * 10) / 10;
-// Marks are rounded down so the part starts at (not after) the moment you tapped.
+// Marks are rounded down so they sit at (not after) the moment you tapped.
 const floor1 = x => Math.floor(x * 10) / 10;
+const byTime = (a, b) => a.t - b.t;
 
 /* ------------------------------------------------------------------ */
 /* Screens and sheets. The phone's back button closes the top one.    */
@@ -62,6 +69,7 @@ function openScreen(name, build, { onClose, canClose } = {}) {
     close() { el.hidden = true; el.replaceChildren(); onClose?.(); },
   };
   el.replaceChildren();
+  el.className = "screen";
   el.hidden = false;
   el.scrollTop = 0;
   pushOverlay(o);
@@ -91,6 +99,11 @@ function btn(text, onclick, cls = "") {
   return h("button", { class: "btn " + cls, type: "button", onclick }, text);
 }
 
+// Adds children to a sheet, skipping empty ones.
+function fill(el, ...kids) {
+  el.append(...kids.flat().filter(k => k != null && k !== false));
+}
+
 function confirmSheet({ title, body, ok = "OK", cancel = "Cancel", danger = false, typeToConfirm = null }) {
   return new Promise(resolve => {
     let answered = false;
@@ -105,11 +118,11 @@ function confirmSheet({ title, body, ok = "OK", cancel = "Cancel", danger = fals
         }
         answered = true; resolve(true); close();
       }, danger ? "danger" : "primary");
-      s.append(...[
+      fill(s,
         h("h3", {}, title),
         body ? (typeof body === "string" ? h("p", { class: "muted" }, body) : body) : null,
         input,
-        h("div", { class: "sheet-actions" }, cancel ? btn(cancel, close) : null, okBtn)].filter(Boolean));
+        h("div", { class: "sheet-actions" }, cancel ? btn(cancel, close) : null, okBtn));
     }, { onClose: () => { if (!answered) resolve(false); } });
   });
 }
@@ -118,10 +131,10 @@ function promptSheet({ title, value = "", placeholder = "", ok = "Save" }) {
   return new Promise(resolve => {
     let answer = null;
     openSheet((s, close) => {
-      const input = h("input", { class: "input", value, placeholder, autocomplete: "off", enterkeyhint: "done" });
+      const input = h("input", { class: "input", value, placeholder, autocomplete: "off", autocapitalize: "off", enterkeyhint: "done" });
       const submit = () => { const v = input.value.trim(); if (!v) { input.focus(); return; } answer = v; close(); };
       input.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
-      s.append(h("h3", {}, title), input, h("div", { class: "sheet-actions" }, btn("Cancel", close), btn(ok, submit, "primary")));
+      fill(s, h("h3", {}, title), input, h("div", { class: "sheet-actions" }, btn("Cancel", close), btn(ok, submit, "primary")));
       setTimeout(() => input.focus(), 50);
     }, { onClose: () => resolve(answer) });
   });
@@ -137,128 +150,132 @@ function toast(msg, ms = 3000) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Tags                                                               */
+/* Tags and the B / I buttons                                         */
 /* ------------------------------------------------------------------ */
 
-async function createTag({ kind, name, parentId = null }) {
-  const t = { id: uid(), kind, name: name.trim(), parentId, order: Date.now(), createdAt: Date.now() };
-  if (kind === "topic" && !parentId) t.color = COLORS[state.tags.roots().length % COLORS.length];
-  await db.put("tags", t);
+// Asks for a name and creates the tag. A tag that already exists is reused.
+async function newTag() {
+  const name = await promptSheet({ title: "New tag", placeholder: "e.g. just_chatting", ok: "Add" });
+  if (!name) return null;
+  const same = state.tags.tags().find(t => fold(t.name) === fold(name));
+  if (same) { toast("You already have this tag."); return same; }
+  const t = { id: uid(), kind: "label", name, parentId: null, order: Date.now(), createdAt: Date.now() };
+  try { await db.put("tags", t); } catch (err) { toast("Could not save: " + err.message); return null; }
   state.tags.set([...state.tags.list, t]);
   return t;
 }
 
-function tagChip(id, extra = "") {
-  return h("span", { class: "chip " + extra, style: `--c:${state.tags.color(id)}` }, h("span", { class: "dot" }), state.tags.pathName(id));
-}
-
-function labelChip(id) {
-  return h("span", { class: "chip label" }, "#" + state.tags.name(id));
-}
-
-// The topic tree in a sheet. Resolves with the chosen id (or undefined).
-function pickTopic({ title, current = null, exclude = null, topLevelOption = null }) {
-  return new Promise(resolve => {
-    let picked;
-    openSheet((s, close) => {
-      const input = h("input", { class: "input", type: "search", placeholder: "Find a topic…", autocomplete: "off" });
-      const tree = h("div", { class: "tree" });
-      const render = () => {
-        const q = fold(input.value.trim());
-        tree.replaceChildren();
-        for (const { tag, depth } of state.tags.flatTree()) {
-          if (exclude?.has(tag.id)) continue;
-          const full = state.tags.pathName(tag.id);
-          if (q && !fold(full).includes(q)) continue;
-          tree.append(h("div", { class: "tree-row" + (tag.id === current ? " current" : ""), style: `--d:${q ? 0 : depth}` },
-            h("button", { class: "tree-pick", type: "button", style: `--c:${state.tags.color(tag.id)}`, onclick: () => { picked = tag.id; close(); } },
-              h("span", { class: "dot" }), q ? full : tag.name),
-            h("button", {
-              class: "icon-btn add-sub", type: "button", "aria-label": "Add a sub-topic", title: "Add a sub-topic",
-              onclick: async () => {
-                const name = await promptSheet({ title: `New topic under “${full}”`, placeholder: "e.g. Printify" });
-                if (name) { await createTag({ kind: "topic", name, parentId: tag.id }); input.value = ""; render(); }
-              },
-            }, "+")));
-        }
-        if (!tree.children.length) tree.append(h("p", { class: "muted small" }, q ? "No topic matches." : "No topics yet."));
-      };
-      input.addEventListener("input", render);
-      s.append(
-        h("h3", {}, title),
-        input,
-        topLevelOption ? btn(topLevelOption, () => { picked = null; close(); }, "wide") : "",
-        tree,
-        h("div", { class: "sheet-actions" },
-          btn("+ Main topic", async () => {
-            const name = await promptSheet({ title: "New main topic", placeholder: "e.g. Health" });
-            if (name) { await createTag({ kind: "topic", name }); render(); }
-          }),
-          btn("Cancel", close)));
-      render();
-    }, { onClose: () => resolve(picked) });
-  });
-}
-
-// Big topic buttons used while recording and while listening: tap a topic
-// when the subject changes; then optionally narrow it to a sub-topic.
-function topicPad({ onAdd, onRefine, timeOf }) {
+// The buttons you tap while recording or listening: B / I start a part,
+// a tag drops a point.
+function markPad({ onPart, onPoint }) {
   const wrap = h("div", { class: "pad" });
-  let cur = null;
+  let active = null;
   const render = () => {
-    wrap.replaceChildren();
-    wrap.append(h("div", { class: "pad-row" },
-      state.tags.roots().map(t => h("button", {
-        class: "pad-btn", type: "button", style: `--c:${t.color}`,
-        onclick: () => { cur = onAdd(t.id); render(); },
-      }, t.name)),
-      h("button", {
-        class: "pad-btn ghost", type: "button",
-        onclick: async () => {
-          const name = await promptSheet({ title: "New main topic", placeholder: "e.g. Health" });
-          if (name) { const t = await createTag({ kind: "topic", name }); cur = onAdd(t.id); render(); }
-        },
-      }, "+ New")));
-    if (cur) {
-      const kids = state.tags.children(cur.tag);
-      wrap.append(h("div", { class: "pad-sub", style: `--c:${state.tags.color(cur.tag)}` },
-        h("div", { class: "pad-sub-head" },
-          h("span", { class: "muted" }, `From ${fmtClock(timeOf(cur))}: `),
-          h("b", {}, state.tags.pathName(cur.tag)),
-          h("button", { class: "link", type: "button", onclick: () => { cur = null; render(); } }, "OK")),
-        h("div", { class: "pad-row small" },
-          kids.map(k => h("button", {
-            class: "pad-btn small", type: "button", style: `--c:${state.tags.color(k.id)}`,
-            onclick: () => { cur.tag = k.id; onRefine(cur); render(); },
-          }, k.name)),
-          h("button", {
-            class: "pad-btn small ghost", type: "button",
-            onclick: async () => {
-              const name = await promptSheet({ title: `New topic under “${state.tags.pathName(cur.tag)}”`, placeholder: "e.g. Printify" });
-              if (name && cur) { const t = await createTag({ kind: "topic", name, parentId: cur.tag }); cur.tag = t.id; onRefine(cur); render(); }
-            },
-          }, "+ sub-topic"))));
-    }
+    wrap.replaceChildren(
+      h("div", { class: "pad-row" }, state.tags.parts().map(t => h("button", {
+        class: "pad-btn" + (t.id === active ? " active" : ""), type: "button", style: `--c:${t.color}`, "data-id": t.id,
+        onclick: () => onPart(t.id),
+      }, t.name))),
+      h("div", { class: "pad-tags" },
+        state.tags.tags().map(t => h("button", {
+          class: "tag-btn", type: "button",
+          onclick: e => {
+            onPoint(t.id);
+            const b = e.currentTarget;
+            b.classList.add("flash");
+            setTimeout(() => b.classList.remove("flash"), 350);
+          },
+        }, t.name)),
+        h("button", { class: "tag-btn add", type: "button", onclick: async () => { if (await newTag()) render(); } }, "+ new tag")));
   };
   render();
-  return { el: wrap, render, reset() { cur = null; render(); } };
+  return {
+    el: wrap,
+    render,
+    // Lights up the part that is running right now.
+    setActive(id) {
+      if (id === active) return;
+      active = id;
+      for (const b of wrap.querySelectorAll(".pad-btn")) b.classList.toggle("active", b.dataset.id === id);
+    },
+  };
 }
 
 // Parts of a recording: each mark starts a part that lasts until the next mark.
 function segments(r, duration) {
   const d = duration || r.durationSec || 0;
-  const ms = [...(r.marks || [])].sort((a, b) => a.t - b.t);
+  const ms = [...(r.marks || [])].sort(byTime);
   return ms.map((m, i) => ({ start: m.t, end: Math.max(m.t, i + 1 < ms.length ? ms[i + 1].t : d), tag: m.tag, mark: m }));
 }
 
-function segStrip(r, cls = "seg-strip") {
-  const d = r.durationSec || 0;
-  const el = h("div", { class: cls });
-  if (!d) return el;
-  for (const s of segments(r, d)) {
-    el.append(h("span", { style: `left:${(s.start / d) * 100}%;width:${((s.end - s.start) / d) * 100}%;background:${state.tags.color(s.tag)}` }));
+function partAt(r, t, duration) {
+  let found = null;
+  for (const s of segments(r, duration)) if (t >= s.start) found = s;
+  return found;
+}
+
+// Starts a part at second t (unless that part is already running).
+function addPart(r, t, id, duration) {
+  const cur = partAt(r, t, duration);
+  if (cur && state.tags.root(cur.tag)?.id === id) return false;
+  if (cur && cur.start === t) cur.mark.tag = id;
+  else r.marks = [...(r.marks || []), { t, tag: id }].sort(byTime);
+  return true;
+}
+
+function addPoint(r, t, id) {
+  r.points = [...(r.points || []), { t, tag: id }].sort(byTime);
+}
+
+// Coloured bars for the parts and dots for the tags, placed along a timeline.
+function drawTimeline(r, dur, barLayer, dotLayer) {
+  barLayer.replaceChildren();
+  dotLayer.replaceChildren();
+  if (!dur) return;
+  const pct = x => Math.min(100, (x / dur) * 100);
+  for (const s of segments(r, dur)) {
+    barLayer.append(h("span", { style: `left:${pct(s.start)}%;width:${pct(s.end - s.start)}%;background:${state.tags.color(s.tag)}` }));
   }
-  return el;
+  for (const p of r.points || []) dotLayer.append(h("span", { style: `left:${pct(p.t)}%` }));
+}
+
+function strip(r) {
+  const bars = h("div", { class: "strip-bars" });
+  const dots = h("div", { class: "strip-dots" });
+  drawTimeline(r, r.durationSec || 0, bars, dots);
+  return h("div", { class: "strip" }, dots, bars);
+}
+
+// The list of everything marked on a recording, in order of time.
+function marksList(r, dur, { onJump, onRemove, empty } = {}) {
+  const rows = [
+    ...segments(r, dur).map(s => ({ t: s.start, tag: s.tag, part: true, len: dur ? s.end - s.start : 0, from: "marks", ref: s.mark })),
+    ...(r.points || []).map(p => ({ t: p.t, tag: p.tag, from: "points", ref: p })),
+  ].sort(byTime);
+  // Whole-recording tags from the first version of the app.
+  for (const id of r.topics || []) rows.push({ tag: id, part: true, from: "topics" });
+  for (const id of r.labels || []) rows.push({ tag: id, from: "labels" });
+
+  const box = h("div", { class: "marks" });
+  if (!rows.length && empty) box.append(h("p", { class: "muted small" }, empty));
+  for (const row of rows) {
+    const timed = row.t != null;
+    const time = timed ? fmtClock(row.t) : "all";
+    box.append(h("div", { class: "mark-row " + (row.part ? "part" : "point"), style: `--c:${state.tags.color(row.tag)}` },
+      onJump && timed
+        ? h("button", { class: "mark-time", type: "button", title: "Play from here", onclick: () => onJump(row.t) }, "▶ " + time)
+        : h("span", { class: "mark-time" }, time),
+      h("span", { class: "mark-tag" }, row.part ? null : h("span", { class: "dot" }), state.tags.name(row.tag)),
+      row.len ? h("span", { class: "mark-len" }, fmtLength(row.len)) : null,
+      onRemove ? h("button", {
+        class: "icon-btn", type: "button", "aria-label": "Remove",
+        onclick: () => {
+          r[row.from] = timed ? r[row.from].filter(x => x !== row.ref) : r[row.from].filter(x => x !== row.tag);
+          onRemove();
+        },
+      }, "✕") : null));
+  }
+  return box;
 }
 
 /* ------------------------------------------------------------------ */
@@ -266,30 +283,43 @@ function segStrip(r, cls = "seg-strip") {
 /* ------------------------------------------------------------------ */
 
 const isDue = r => r.lock && r.lock.until <= todayISO();
-const needsTagging = r => !r.lock && !r.topics?.length && !r.marks?.length && !r.labels?.length;
-const tagIdsOf = r => new Set([...(r.topics || []), ...(r.marks || []).map(m => m.tag).filter(Boolean)]);
+const isTagged = r => !!(r.marks?.length || r.points?.length || r.topics?.length || r.labels?.length);
+const needsTagging = r => !r.lock && !isTagged(r);
+
+// Does the recording have this part (B / I) or this tag anywhere?
+function hasTag(r, id) {
+  if (state.tags.isPart(id)) {
+    const want = state.tags.descendants(id);
+    return (r.marks || []).some(m => want.has(m.tag)) || (r.topics || []).some(i => want.has(i));
+  }
+  return (r.points || []).some(p => p.tag === id) || (r.labels || []).includes(id);
+}
+
+// Which parts and tags a recording has, without repeats.
+function tagsOf(r) {
+  const parts = new Set(), tags = new Set();
+  for (const id of [...(r.marks || []).map(m => m.tag), ...(r.topics || [])]) {
+    const root = state.tags.root(id);
+    if (root) parts.add(root.id);
+  }
+  for (const id of [...(r.points || []).map(p => p.tag), ...(r.labels || [])]) if (state.tags.get(id)) tags.add(id);
+  return { parts: [...parts], tags: [...tags] };
+}
 
 function haystack(r) {
   const when = [dayKey(r.startedAt), fmtDay(r.startedAt), fmtTime(r.startedAt)].join(" ");
   if (r.lock) return fold(when + " locked");
-  const parts = [r.title, r.note, r.originalName, when];
-  for (const id of tagIdsOf(r)) parts.push(state.tags.pathName(id));
-  for (const id of r.labels || []) parts.push(state.tags.name(id));
-  return fold(parts.join(" "));
+  const { parts, tags } = tagsOf(r);
+  return fold([r.title, r.note, r.originalName, when, ...[...parts, ...tags].map(id => state.tags.name(id))].join(" "));
 }
 
 function matches(r) {
   const f = state.filter;
   if (f.untagged && !needsTagging(r)) return false;
   if (f.locked && !r.lock) return false;
-  if (f.tags.length || f.labels.length) {
+  if (f.ids.length) {
     if (r.lock) return false;
-    const ids = tagIdsOf(r);
-    for (const tid of f.tags) {
-      const want = state.tags.descendants(tid);
-      if (![...ids].some(id => want.has(id))) return false;
-    }
-    for (const lid of f.labels) if (!(r.labels || []).includes(lid)) return false;
+    for (const id of f.ids) if (!hasTag(r, id)) return false;
   }
   if (f.q.trim()) {
     const hay = haystack(r);
@@ -325,28 +355,20 @@ function renderBanner() {
 
 function renderFilters() {
   const f = state.filter;
-  const box = $("#filters");
   const chip = (content, on, onclick, color) =>
     h("button", { class: "fchip" + (on ? " on" : ""), type: "button", onclick, style: color ? `--c:${color}` : null }, content);
-  box.replaceChildren(
-    chip("+ Topic", false, async () => {
-      const id = await pickTopic({ title: "Show recordings about…" });
-      if (id && !f.tags.includes(id)) { f.tags.push(id); renderAll(); }
-    }),
-    ...f.tags.map(id => chip([h("span", { class: "dot" }), state.tags.pathName(id), " ✕"], true,
-      () => { f.tags = f.tags.filter(x => x !== id); renderAll(); }, state.tags.color(id))),
-    chip("Needs tagging", f.untagged, () => { f.untagged = !f.untagged; renderAll(); }),
-    ...state.tags.labels().map(l => chip("#" + l.name, f.labels.includes(l.id), () => {
-      f.labels = f.labels.includes(l.id) ? f.labels.filter(x => x !== l.id) : [...f.labels, l.id];
-      renderAll();
-    })),
+  const toggle = id => { f.ids = f.ids.includes(id) ? f.ids.filter(x => x !== id) : [...f.ids, id]; renderAll(); };
+  $("#filters").replaceChildren(
+    chip("Not tagged yet", f.untagged, () => { f.untagged = !f.untagged; renderAll(); }),
+    ...state.tags.parts().map(t => chip([h("span", { class: "dot" }), t.name], f.ids.includes(t.id), () => toggle(t.id), t.color)),
+    ...state.tags.tags().map(t => chip(t.name, f.ids.includes(t.id), () => toggle(t.id))),
     chip("🔒 Locked", f.locked, () => { f.locked = !f.locked; renderAll(); }),
   );
 }
 
 function filtersActive() {
   const f = state.filter;
-  return !!(f.q.trim() || f.tags.length || f.labels.length || f.untagged || f.locked);
+  return !!(f.q.trim() || f.ids.length || f.untagged || f.locked);
 }
 
 function renderList() {
@@ -371,7 +393,7 @@ function renderList() {
       : h("div", { class: "empty" },
           h("p", { class: "empty-title" }, "No recordings yet"),
           h("p", { class: "muted" }, "Tap the lime button to record. Already have recordings on this phone? Import them."),
-          btn("Import recordings", () => $("#import-input").click(), "primary")));
+          btn("Import old recordings", () => $("#import-input").click(), "primary")));
     renderRail();
     return;
   }
@@ -387,11 +409,12 @@ function renderList() {
 }
 
 function clearFilters() {
-  state.filter = { q: "", tags: [], labels: [], untagged: false, locked: false };
+  state.filter = { q: "", ids: [], untagged: false, locked: false };
   $("#search").value = "";
   renderAll();
 }
 
+// Tap the card to listen; tap the pencil to edit.
 function card(r) {
   const time = h("div", { class: "card-time" }, fmtTime(r.startedAt));
   const len = h("div", { class: "card-len" }, fmtClock(r.durationSec));
@@ -403,19 +426,26 @@ function card(r) {
           isDue(r) ? " Unlock date reached" : ` Locked until ${fmtISODate(r.lock.until)}`)),
       len);
   }
-  const chips = [...[...tagIdsOf(r)].map(id => tagChip(id)), ...(r.labels || []).map(labelChip)];
+  const { parts, tags } = tagsOf(r);
+  const chips = [
+    ...parts.map(id => h("span", { class: "chip", style: `--c:${state.tags.color(id)}` }, state.tags.name(id))),
+    ...tags.map(id => h("span", { class: "chip label" }, state.tags.name(id))),
+  ];
   const shown = chips.slice(0, 4);
   if (chips.length > 4) shown.push(h("span", { class: "chip more" }, `+${chips.length - 4}`));
-  return h("div", {
-    class: "card", role: "button", tabindex: "0",
-    onclick: () => openDetail(r.id, { focusTag: state.filter.tags[0] }),
-  },
+  const focus = state.filter.ids[0];
+  return h("div", { class: "card", role: "button", tabindex: "0", onclick: () => openDetail(r.id, { focus }) },
     time,
     h("div", { class: "card-body" },
       h("div", { class: "card-title" + (r.title ? "" : " muted") }, r.title || "Untitled"),
-      r.marks?.length ? segStrip(r) : null,
+      r.marks?.length || r.points?.length ? strip(r) : null,
       shown.length ? h("div", { class: "chips" }, shown) : null),
-    len);
+    h("div", { class: "card-side" },
+      len,
+      h("button", {
+        class: "icon-btn edit-btn", type: "button", "aria-label": "Edit", title: "Edit", svg: icons.pencil,
+        onclick: e => { e.stopPropagation(); openDetail(r.id, { edit: true, focus }); },
+      })));
 }
 
 /* Time rail: a vertical bar on the right. Its height covers the whole time
@@ -440,15 +470,12 @@ function renderRail() {
   // Month names along the rail.
   const first = new Date(g[g.length - 1].ts);
   let y = first.getFullYear(), m = first.getMonth() + 1;
-  let lastTop = -1;
   for (let i = 0; i < 600; i++) {
     if (m > 11) { m = 0; y++; }
     const n = Date.UTC(y, m, 1) / 864e5;
     if (n > max) break;
-    const top = ((max - n) / span) * 100;
     const name = new Date(y, m, 1).toLocaleDateString("en-GB", { month: "short" }) + (m === 0 ? ` ${String(y).slice(2)}` : "");
-    ticks.append(h("span", { class: "rail-month", style: `top:${top}%` }, name));
-    lastTop = top;
+    ticks.append(h("span", { class: "rail-month", style: `top:${((max - n) / span) * 100}%` }, name));
     m++;
   }
   rail.hidden = false;
@@ -548,7 +575,7 @@ function lockSheet(r) {
       const lockBtn = btn("", async () => {
         if (!choice || choice <= todayISO()) { toast("Pick a date in the future."); return; }
         r.lock = { until: choice, setAt: Date.now() };
-        try { await db.saveRecording(r); } catch (err) { delete r.lock; toast("Could not save: " + err.message); return; }
+        try { await db.saveRecording(r); } catch (err) { r.lock = null; toast("Could not save: " + err.message); return; }
         locked = true;
         close();
       }, "danger");
@@ -560,7 +587,7 @@ function lockSheet(r) {
         lockBtn.textContent = choice ? `Lock until ${fmtISODate(choice)}` : "Pick a date";
       };
       custom.addEventListener("change", () => { choice = custom.value || null; render(); });
-      s.append(
+      fill(s,
         h("h3", {}, "Lock this recording"),
         h("p", { class: "muted" }, "Until that date you won't be able to play it, and its title, notes and tags stay hidden. When the date comes, you choose: unlock it, or lock it for one more year."),
         options,
@@ -575,7 +602,7 @@ function lockSheet(r) {
 function openLocked(r) {
   openSheet((s, close) => {
     const due = isDue(r);
-    s.append(
+    fill(s,
       h("h3", {}, due ? "🔓 Unlock date reached" : "🔒 Locked"),
       h("p", { class: "muted" }, `Recorded ${fmtDay(r.startedAt)} at ${fmtTime(r.startedAt)} · ${fmtLength(r.durationSec)}`),
       h("p", {}, due
@@ -587,7 +614,7 @@ function openLocked(r) {
           btn(`Lock until ${fmtISODate(plusYear(r.lock.until))}`, async () => {
             r.lock.until = plusYear(r.lock.until);
             r.lock.extended = (r.lock.extended || 0) + 1;
-            await db.saveRecording(r);
+            try { await db.saveRecording(r); } catch (err) { toast("Could not save: " + err.message); }
             renderAll();
             close();
             toast(`Locked until ${fmtISODate(r.lock.until)}.`);
@@ -610,17 +637,17 @@ function openLocked(r) {
 
 async function unlock(r) {
   const old = r.lock;
-  delete r.lock;
+  r.lock = null;
   r.unlockedAt = Date.now();
   try { await db.saveRecording(r); } catch (err) { r.lock = old; toast("Could not save: " + err.message); }
   renderAll();
 }
 
 /* ------------------------------------------------------------------ */
-/* Recording page: player, parts, tags, notes                          */
+/* One recording: listen (nothing can change) or edit                  */
 /* ------------------------------------------------------------------ */
 
-async function openDetail(id, { focusTag = null, justRecorded = false } = {}) {
+async function openDetail(id, { edit = false, focus = null } = {}) {
   const r = state.recs.find(x => x.id === id);
   if (!r) return;
   if (r.lock) { openLocked(r); return; }
@@ -629,9 +656,11 @@ async function openDetail(id, { focusTag = null, justRecorded = false } = {}) {
   const url = blob ? URL.createObjectURL(blob) : null;
   const audio = new Audio();
   audio.preload = "metadata";
+  let editing = edit && !db.isReadOnly();
   let dur = r.durationSec || 0;
   let raf = 0;
   let saveTimer = null;
+  let startAt = 0;
   const SPEEDS = [1, 1.25, 1.5, 2, 0.75];
 
   const save = async () => {
@@ -645,14 +674,16 @@ async function openDetail(id, { focusTag = null, justRecorded = false } = {}) {
     const playBtn = h("button", { class: "play-btn", type: "button", "aria-label": "Play", svg: icons.play });
     const cur = h("span", {}, "0:00");
     const total = h("span", {}, fmtClock(dur));
-    const segLayer = h("div", { class: "seek-segs" });
+    const barLayer = h("div", { class: "seek-segs" });
+    const dotLayer = h("div", { class: "seek-dots" });
     const progress = h("div", { class: "seek-progress" });
     const thumb = h("div", { class: "seek-thumb" });
-    const seek = h("div", { class: "seek" }, segLayer, progress, thumb);
+    const seek = h("div", { class: "seek" }, barLayer, progress, dotLayer, thumb);
     const nowLine = h("div", { class: "now-line" });
     const speedBtn = h("button", { class: "small-btn", type: "button" }, "1×");
 
     const play = () => audio.play().catch(err => toast("Can't play: " + err.message));
+    const playFrom = t => { audio.currentTime = t; play(); };
     playBtn.onclick = () => (audio.paused ? play() : audio.pause());
     const jump = d => { audio.currentTime = Math.max(0, Math.min(dur || Infinity, audio.currentTime + d)); tick(); };
     speedBtn.onclick = () => {
@@ -673,22 +704,17 @@ async function openDetail(id, { focusTag = null, justRecorded = false } = {}) {
     seek.addEventListener("pointerup", () => { seeking = false; });
     seek.addEventListener("pointercancel", () => { seeking = false; });
 
-    function currentSeg(t) {
-      let found = null;
-      for (const s of segments(r, dur)) if (t >= s.start) found = s;
-      return found;
-    }
-
     function tick() {
       const t = audio.currentTime || 0;
       const frac = dur ? Math.min(1, t / dur) : 0;
       progress.style.width = frac * 100 + "%";
       thumb.style.left = frac * 100 + "%";
       cur.textContent = fmtClock(t);
-      const s = currentSeg(t);
+      const s = partAt(r, t, dur);
+      pad.setActive(s ? state.tags.root(s.tag)?.id : null);
       nowLine.replaceChildren(s
-        ? h("span", { style: `--c:${state.tags.color(s.tag)}` }, h("span", { class: "dot" }), "Now: ", h("b", {}, state.tags.pathName(s.tag)))
-        : h("span", { class: "muted" }, r.marks?.length ? "Before the first part" : ""));
+        ? h("span", { style: `--c:${state.tags.color(s.tag)}` }, h("span", { class: "dot" }), "Now: ", h("b", {}, state.tags.name(s.tag)))
+        : "");
     }
     const loop = () => { tick(); raf = requestAnimationFrame(loop); };
 
@@ -707,109 +733,45 @@ async function openDetail(id, { focusTag = null, justRecorded = false } = {}) {
     audio.addEventListener("durationchange", () => {
       if (fixingDuration && isFinite(audio.duration)) { fixingDuration = false; audio.currentTime = startAt; useDuration(); }
     });
-    let startAt = 0;
     function useDuration() {
       if (isFinite(audio.duration) && audio.duration > 0) {
         if (!dur || Math.abs(audio.duration - dur) > 2) {
           dur = audio.duration;
           r.durationSec = round1(dur);
-          save();
+          if (!db.isReadOnly()) save();
         }
         total.textContent = fmtClock(dur);
-        refreshParts();
+        refresh();
       }
       if (startAt && !fixingDuration) audio.currentTime = startAt;
       tick();
     }
 
-    /* --- parts --- */
-    const marksBox = h("div", { class: "marks" });
-    const pad = topicPad({
-      timeOf: m => m.t,
-      onAdd: tag => {
-        const m = { t: floor1(audio.currentTime || 0), tag };
-        r.marks = [...(r.marks || []), m].sort((a, b) => a.t - b.t);
-        save(); refreshParts();
-        return m;
+    /* --- B / I and tags --- */
+    const now = () => floor1(audio.currentTime || 0);
+    const pad = markPad({
+      onPart: tag => {
+        if (!addPart(r, now(), tag, dur)) { toast(`This part is already “${state.tags.name(tag)}”.`); return; }
+        save(); refresh();
       },
-      onRefine: () => { save(); refreshParts(); },
+      onPoint: tag => { addPoint(r, now(), tag); save(); refresh(); },
     });
 
-    function refreshParts() {
-      segLayer.replaceChildren();
-      if (dur) for (const s of segments(r, dur)) {
-        segLayer.append(h("span", { style: `left:${(s.start / dur) * 100}%;width:${((s.end - s.start) / dur) * 100}%;background:${state.tags.color(s.tag)}` }));
-      }
-      marksBox.replaceChildren();
-      const segs = segments(r, dur);
-      if (!segs.length) {
-        marksBox.append(h("p", { class: "muted small" }, "No parts yet. While listening, tap a topic above when the subject changes."));
-      }
-      for (const s of segs) {
-        marksBox.append(h("div", { class: "mark-row", style: `--c:${state.tags.color(s.tag)}` },
-          h("button", { class: "mark-time", type: "button", title: "Play from here", onclick: () => { audio.currentTime = s.start; play(); } }, "▶ " + fmtClock(s.start)),
-          h("button", {
-            class: "mark-tag", type: "button", title: "Change topic",
-            onclick: async () => {
-              const id = await pickTopic({ title: "Topic of this part", current: s.tag });
-              if (id) { s.mark.tag = id; save(); refreshParts(); pad.render(); }
-            },
-          }, h("span", { class: "dot" }), state.tags.pathName(s.tag)),
-          h("span", { class: "mark-len" }, fmtLength(s.end - s.start)),
-          h("button", {
-            class: "small-btn", type: "button", title: "Make this part start where the player is now",
-            onclick: () => {
-              s.mark.t = floor1(audio.currentTime || 0);
-              r.marks.sort((a, b) => a.t - b.t);
-              save(); refreshParts();
-            },
-          }, "start here"),
-          h("button", {
-            class: "icon-btn", type: "button", "aria-label": "Remove this part",
-            onclick: () => { r.marks = r.marks.filter(x => x !== s.mark); save(); pad.reset(); refreshParts(); },
-          }, "✕")));
-      }
+    const listBox = h("div");
+    function refresh() {
+      drawTimeline(r, dur, barLayer, dotLayer);
+      listBox.replaceChildren(marksList(r, dur, {
+        onJump: playFrom,
+        onRemove: editing ? () => { save(); refresh(); } : null,
+        empty: editing
+          ? "Nothing marked yet. Play the recording, then tap B or I when a part starts, and a tag at the moment it fits."
+          : "Not tagged yet. Tap Edit to mark the B / I parts and add tags.",
+      }));
       tick();
     }
 
-    /* --- whole recording topics and labels --- */
-    const wholeBox = h("div", { class: "chips wrap" });
-    function renderWhole() {
-      wholeBox.replaceChildren(
-        ...(r.topics || []).map(id => h("button", {
-          class: "chip removable", type: "button", style: `--c:${state.tags.color(id)}`,
-          onclick: () => { r.topics = r.topics.filter(x => x !== id); save(); renderWhole(); },
-        }, h("span", { class: "dot" }), state.tags.pathName(id), h("span", { class: "x" }, " ✕"))),
-        h("button", {
-          class: "chip add", type: "button",
-          onclick: async () => {
-            const id = await pickTopic({ title: "The whole recording is about…" });
-            if (id && !(r.topics || []).includes(id)) { r.topics = [...(r.topics || []), id]; save(); renderWhole(); }
-          },
-        }, "+ topic"));
-    }
-
-    const labelsBox = h("div", { class: "chips wrap" });
-    function renderLabels() {
-      labelsBox.replaceChildren(
-        ...state.tags.labels().map(l => {
-          const on = (r.labels || []).includes(l.id);
-          return h("button", {
-            class: "chip toggle" + (on ? " on" : ""), type: "button",
-            onclick: () => { r.labels = on ? r.labels.filter(x => x !== l.id) : [...(r.labels || []), l.id]; save(); renderLabels(); },
-          }, "#" + l.name);
-        }),
-        h("button", {
-          class: "chip add", type: "button",
-          onclick: async () => {
-            const name = await promptSheet({ title: "New label", placeholder: "e.g. gratitude" });
-            if (name) { const t = await createTag({ kind: "label", name }); r.labels = [...(r.labels || []), t.id]; save(); renderLabels(); }
-          },
-        }, "+ new label"));
-    }
-
     /* --- text --- */
-    const title = h("input", { class: "title-input", value: r.title || "", placeholder: "Untitled — add a title", autocomplete: "off" });
+    const title = h("input", { class: "title-input", value: r.title || "", placeholder: "Add a title", autocomplete: "off" });
     title.addEventListener("input", () => { r.title = title.value; saveSoon(); });
     const note = h("textarea", { class: "input note", rows: "3", placeholder: "Notes…" });
     note.value = r.note || "";
@@ -821,48 +783,56 @@ async function openDetail(id, { focusTag = null, justRecorded = false } = {}) {
       fmtBytes(r.size),
     ].filter(Boolean).join(" · ");
 
-    el.append(
-      screenHeader(h("span", {}, fmtDayShort(r.startedAt), h("span", { class: "muted" }, " · " + fmtTime(r.startedAt))), close),
-      h("div", { class: "screen-body" },
-        title,
-        !url ? h("p", { class: "warn" }, "The audio for this recording is missing on this phone.") : null,
-        h("div", { class: "player" },
-          seek,
-          h("div", { class: "times" }, cur, total),
-          h("div", { class: "controls" },
-            h("button", { class: "small-btn", type: "button", onclick: () => jump(-10) }, "−10s"),
-            playBtn,
-            h("button", { class: "small-btn", type: "button", onclick: () => jump(10) }, "+10s"),
-            speedBtn),
-          nowLine),
-        h("h4", { class: "section-title" }, "Tag the part playing now"),
-        pad.el,
-        h("h4", { class: "section-title" }, "Parts"),
-        marksBox,
-        h("h4", { class: "section-title" }, "The whole recording is about"),
-        wholeBox,
-        h("h4", { class: "section-title" }, "Labels"),
-        labelsBox,
-        h("h4", { class: "section-title" }, "Notes"),
-        note,
-        h("div", { class: "danger-zone" },
-          btn("🔒 Lock it (dangerous — don't listen until later)", async () => {
-            audio.pause();
-            if (await lockSheet(r)) { close(); toast(`Locked until ${fmtISODate(r.lock.until)}.`); }
-          }, "wide"),
-          btn("Delete this recording…", () => deleteRec(r, close), "wide quiet danger-text")),
-        h("p", { class: "info" }, info)));
+    const player = h("div", { class: "player" },
+      seek,
+      h("div", { class: "times" }, cur, total),
+      h("div", { class: "controls" },
+        h("button", { class: "small-btn", type: "button", onclick: () => jump(-10) }, "−10s"),
+        playBtn,
+        h("button", { class: "small-btn", type: "button", onclick: () => jump(10) }, "+10s"),
+        speedBtn),
+      nowLine);
 
-    renderWhole();
-    renderLabels();
-    refreshParts();
+    const when = h("span", {}, fmtDayShort(r.startedAt), h("span", { class: "muted" }, " · " + fmtTime(r.startedAt)));
+    const section = text => h("h4", { class: "section-title" }, text);
 
-    if (focusTag) {
-      const want = state.tags.descendants(focusTag);
-      const m = segments(r, dur).find(s => want.has(s.tag));
-      if (m) { startAt = m.start; toast(`Starts at the “${state.tags.name(focusTag)}” part.`); }
+    // The same screen in two modes. Listening shows everything but changes
+    // nothing; editing adds the buttons.
+    function draw() {
+      el.classList.toggle("editing", editing);
+      const modeBtn = db.isReadOnly() ? null : btn(editing ? "Done" : "Edit", () => {
+        editing = !editing;
+        if (!editing && saveTimer) save();
+        draw();
+      }, "small" + (editing ? " primary" : ""));
+      el.replaceChildren(
+        screenHeader(when, close, modeBtn),
+        h("div", { class: "screen-body" },
+          editing ? h("div", { class: "edit-strip" }, "Editing · changes are saved as you make them") : null,
+          editing ? title : h("h2", { class: "title-text" + (r.title ? "" : " muted") }, r.title || "Untitled"),
+          !url ? h("p", { class: "warn" }, "The audio for this recording is missing on this phone.") : null,
+          player,
+          editing ? [section("Tap at the moment it starts"), pad.el] : null,
+          section("Timeline"),
+          listBox,
+          editing ? [section("Notes"), note] : r.note ? [section("Notes"), h("p", { class: "note-text" }, r.note)] : null,
+          editing ? h("div", { class: "danger-zone" },
+            btn("🔒 Lock it (don't listen until later)", async () => {
+              audio.pause();
+              if (await lockSheet(r)) { close(); toast(`Locked until ${fmtISODate(r.lock.until)}.`); }
+            }, "wide"),
+            btn("Delete this recording…", () => deleteRec(r, close), "wide quiet danger-text")) : null,
+          h("p", { class: "info" }, info)));
+      pad.render();
+      refresh();
     }
-    if (justRecorded) toast("Saved on this phone ✓");
+    draw();
+
+    if (focus) {
+      const want = state.tags.descendants(focus);
+      const hit = [...(r.marks || []), ...(r.points || [])].sort(byTime).find(m => want.has(m.tag));
+      if (hit && hit.t > 0) { startAt = hit.t; toast(`Starts at “${state.tags.name(focus)}”.`); }
+    }
     if (url) audio.src = url;
   }, {
     onClose() {
@@ -905,8 +875,8 @@ async function startRecording() {
 
   const now = Date.now();
   const rec = {
-    id: uid(), v: 1, startedAt: now, durationSec: 0, mimeType: "", ext: "", size: 0,
-    title: "", note: "", topics: [], labels: [], marks: [], lock: null,
+    id: uid(), v: 2, startedAt: now, durationSec: 0, mimeType: "", ext: "", size: 0,
+    title: "", note: "", marks: [], points: [], lock: null,
     source: "app", status: "recording", createdAt: now, updatedAt: now,
   };
   const session = { rec, seq: 0, queue: Promise.resolve(), stopping: false, wake: null, timer: 0 };
@@ -950,21 +920,22 @@ async function startRecording() {
     const timer = h("div", { class: "rec-timer" }, "0:00");
     const meter = h("div", { class: "meter" }, h("div", { class: "meter-fill" }));
     const status = h("div", { class: "rec-status" }, h("span", { class: "rec-dot" }), "Recording · screen stays on");
-    const partsBox = h("div", { class: "marks compact" });
+    const listBox = h("div");
     const errBox = h("p", { class: "warn", hidden: true });
     showSaveError = err => { errBox.textContent = "Saving failed: " + err.message + " — is the phone storage full?"; errBox.hidden = false; };
 
-    const renderParts = () => {
-      partsBox.replaceChildren(...rec.marks.map(m => h("div", { class: "mark-row", style: `--c:${state.tags.color(m.tag)}` },
-        h("span", { class: "mark-time" }, fmtClock(m.t)),
-        h("span", { class: "mark-tag" }, h("span", { class: "dot" }), state.tags.pathName(m.tag)),
-        h("button", { class: "icon-btn", type: "button", "aria-label": "Remove", onclick: () => { rec.marks = rec.marks.filter(x => x !== m); pad.reset(); renderParts(); } }, "✕"))));
-      if (!rec.marks.length) partsBox.append(h("p", { class: "muted small" }, "Tap a topic when you start talking about it. You can also do this later while listening."));
+    const at = () => floor1(recorder.elapsed());
+    const refresh = () => {
+      const last = rec.marks[rec.marks.length - 1];
+      pad.setActive(last ? state.tags.root(last.tag)?.id : null);
+      listBox.replaceChildren(marksList(rec, 0, {
+        onRemove: refresh,
+        empty: "Tap B or I when you start talking about it. Tap a tag at the moment it fits. You can also do all of this later.",
+      }));
     };
-    const pad = topicPad({
-      timeOf: m => m.t,
-      onAdd: tag => { const m = { t: floor1(recorder.elapsed()), tag }; rec.marks.push(m); renderParts(); return m; },
-      onRefine: () => renderParts(),
+    const pad = markPad({
+      onPart: tag => { if (addPart(rec, at(), tag, Infinity)) refresh(); },
+      onPoint: tag => { addPoint(rec, at(), tag); refresh(); },
     });
 
     const pauseBtn = btn("Pause", () => {
@@ -972,27 +943,26 @@ async function startRecording() {
       else { recorder.pause(); pauseBtn.textContent = "Resume"; status.classList.add("paused"); status.lastChild.textContent = "Paused"; }
     }, "big");
     const stopBtn = h("button", { class: "btn big stop", type: "button", onclick: () => stopRecording(session, "user") },
-      h("span", { svg: icons.stop, class: "stop-ico" }), "Stop & save");
-    session.setSaving = () => { stopBtn.disabled = true; pauseBtn.disabled = true; stopBtn.lastChild.textContent = "Saving…"; };
+      h("span", { svg: icons.stop, class: "stop-ico" }), "Stop");
+    session.setSaving = () => { stopBtn.disabled = true; pauseBtn.disabled = true; stopBtn.lastChild.textContent = "Stopping…"; };
 
     el.append(
       screenHeader("New recording", null),
       h("div", { class: "screen-body rec-body" },
         h("div", { class: "rec-top" }, status, timer, meter),
         errBox,
-        h("h4", { class: "section-title" }, "What are you talking about?"),
         pad.el,
-        h("h4", { class: "section-title" }, "Parts so far"),
-        partsBox),
+        h("h4", { class: "section-title" }, "Marked so far"),
+        listBox),
       h("div", { class: "rec-actions" }, pauseBtn, stopBtn));
-    renderParts();
+    refresh();
 
     session.timer = setInterval(() => {
       timer.textContent = fmtClock(recorder.elapsed());
       const lvl = recorder.paused ? 0 : recorder.readLevel();
       meter.firstChild.style.width = Math.round(lvl * 100) + "%";
     }, 100);
-  }, { canClose: () => { toast("Tap “Stop & save” to finish the recording."); return false; } });
+  }, { canClose: () => { toast("Tap “Stop” to finish the recording."); return false; } });
 }
 
 async function keepAwake(session) {
@@ -1029,12 +999,55 @@ async function stopRecording(session, reason) {
   if (finished) {
     state.recs.push(finished);
     renderAll();
-    openDetail(finished.id, { justRecorded: reason === "user" });
-    if (reason === "mic-ended") toast("Recording stopped: another app took the microphone. Saved.", 6000);
-    if (reason === "error") toast("Recording stopped because of an error. What was recorded is saved.", 6000);
+    afterRecording(finished, reason);
   } else if (!session.saveError) {
     toast("Nothing was recorded.");
   }
+}
+
+// Right after stopping: keep it or delete it. The recording is already safe
+// on the phone at this point, so closing this by accident keeps it.
+function afterRecording(r, reason) {
+  let deleted = false;
+  const title = h("input", { class: "input", placeholder: "Title (optional)", autocomplete: "off", enterkeyhint: "done" });
+  const why = reason === "mic-ended" ? "It stopped because another app took the microphone."
+    : reason === "error" ? "It stopped because of an error. What was recorded is kept."
+    : null;
+  openSheet((s, close) => {
+    title.addEventListener("keydown", e => { if (e.key === "Enter") close(); });
+    fill(s,
+      h("h3", {}, `Recording finished · ${fmtClock(r.durationSec)}`),
+      why ? h("p", { class: "warn" }, why) : null,
+      title,
+      h("div", { class: "sheet-actions" },
+        btn("Delete", async () => {
+          const ok = await confirmSheet({
+            title: "Delete this recording?",
+            body: `${fmtLength(r.durationSec)}, recorded just now. It can't be brought back.`,
+            ok: "Delete", cancel: "Keep it", danger: true,
+          });
+          if (!ok) return;
+          try {
+            await db.deleteRecording(r.id);
+            state.recs = state.recs.filter(x => x !== r);
+            deleted = true;
+            close();
+          } catch (err) {
+            toast("Could not delete: " + err.message);
+          }
+        }, "danger-text"),
+        btn("Save", close, "primary")));
+  }, {
+    async onClose() {
+      if (deleted) { renderAll(); toast("Deleted."); return; }
+      if (title.value.trim()) {
+        r.title = title.value.trim();
+        try { await db.saveRecording(r); } catch (err) { toast("Could not save the title: " + err.message); }
+      }
+      renderAll();
+      toast("Saved on this phone ✓");
+    },
+  });
 }
 
 // A recording that was in progress when the app was closed: its saved
@@ -1108,14 +1121,15 @@ async function importFiles(fileList) {
   if (!files.length) { toast("No audio files selected."); return; }
   navigator.storage?.persist?.().catch(() => {});
   const known = new Set(state.recs.map(r => `${r.originalName}|${r.size}`));
-  let added = 0, skipped = 0, failed = [], cancelled = false, stopReason = "";
+  let added = 0, skipped = 0, cancelled = false, stopReason = "";
+  const failed = [];
 
   const progressText = h("p", {}, "Starting…");
   const bar = h("div", { class: "meter" }, h("div", { class: "meter-fill" }));
   let sheet;
   openSheet((s, close) => {
     sheet = { close };
-    s.append(h("h3", {}, "Importing"), progressText, bar,
+    fill(s, h("h3", {}, "Importing"), h("p", { class: "muted small" }, "Keep the app open until it finishes."), progressText, bar,
       h("div", { class: "sheet-actions" }, btn("Stop", () => { cancelled = true; })));
   });
 
@@ -1127,7 +1141,7 @@ async function importFiles(fileList) {
     const fromName = dateFromName(f.name);
     const now = Date.now();
     const rec = {
-      id: uid(), v: 1,
+      id: uid(), v: 2,
       startedAt: fromName ?? f.lastModified,
       dateFrom: fromName ? "file name" : "file date",
       durationSec: await probeDuration(f),
@@ -1135,7 +1149,7 @@ async function importFiles(fileList) {
       ext: (f.name.match(/\.(\w+)$/)?.[1] || "").toLowerCase(),
       size: f.size,
       title: titleFromName(f.name), note: "",
-      topics: [], labels: [], marks: [], lock: null,
+      marks: [], points: [], lock: null,
       source: "import", originalName: f.name, status: "saved",
       createdAt: now, updatedAt: now,
     };
@@ -1156,6 +1170,7 @@ async function importFiles(fileList) {
   if (failed.length) lines.push(`${failed.length} could not be imported: ${failed.slice(0, 5).join(", ")}${failed.length > 5 ? "…" : ""}`);
   if (stopReason) lines.push(stopReason);
   if (cancelled) lines.push("You stopped the import; you can run it again, already-imported files are skipped.");
+  if (added) lines.push("Find them with the “Not tagged yet” filter.");
   await confirmSheet({ title: "Import finished", body: h("div", {}, lines.map(l => h("p", {}, l))), ok: "OK", cancel: null });
 }
 
@@ -1163,45 +1178,42 @@ async function importFiles(fileList) {
 /* Settings                                                            */
 /* ------------------------------------------------------------------ */
 
+const usesAny = (r, ids) =>
+  (r.marks || []).some(m => ids.has(m.tag)) || (r.points || []).some(p => ids.has(p.tag)) ||
+  (r.topics || []).some(i => ids.has(i)) || (r.labels || []).some(i => ids.has(i));
+
 function openSettings() {
   openScreen("settings", (el, close) => {
-    const topicsBox = h("div", { class: "tag-editor" });
-    const labelsBox = h("div", { class: "tag-editor" });
+    const tagsBox = h("div", { class: "tag-editor" });
+    const oldBox = h("div");
     const storageBox = h("div", { class: "muted small" }, "…");
-
-    const usage = ids => state.recs.filter(r =>
-      (r.topics || []).some(i => ids.has(i)) || (r.marks || []).some(m => ids.has(m.tag)) || (r.labels || []).some(i => ids.has(i))).length;
+    const count = ids => state.recs.filter(r => usesAny(r, ids)).length || "";
 
     const renderTags = () => {
-      topicsBox.replaceChildren(...state.tags.flatTree().map(({ tag, depth }) => h("button", {
-        class: "tag-row", type: "button", style: `--d:${depth};--c:${state.tags.color(tag.id)}`,
-        onclick: () => tagActions(tag, renderTags),
-      }, h("span", { class: "dot" }), h("span", { class: "tag-name" }, tag.name), h("span", { class: "tag-count" }, usage(state.tags.descendants(tag.id)) || ""))),
-      btn("+ Main topic", async () => {
-        const name = await promptSheet({ title: "New main topic", placeholder: "e.g. Health" });
-        if (name) { await createTag({ kind: "topic", name }); renderTags(); }
-      }, "wide"));
-      labelsBox.replaceChildren(...state.tags.labels().map(tag => h("button", {
-        class: "tag-row", type: "button", style: "--d:0",
-        onclick: () => tagActions(tag, renderTags),
-      }, h("span", { class: "tag-name" }, "#" + tag.name), h("span", { class: "tag-count" }, usage(new Set([tag.id])) || ""))),
-      btn("+ Label", async () => {
-        const name = await promptSheet({ title: "New label", placeholder: "e.g. gratitude" });
-        if (name) { await createTag({ kind: "label", name }); renderTags(); }
-      }, "wide"));
+      tagsBox.replaceChildren(
+        ...state.tags.tags().map(tag => h("button", { class: "tag-row", type: "button", onclick: () => tagActions(tag, renderTags) },
+          h("span", { class: "tag-name" }, tag.name), h("span", { class: "tag-count" }, count(new Set([tag.id]))))),
+        btn("+ New tag", async () => { if (await newTag()) renderTags(); }, "wide"));
+      const old = state.tags.oldTopics();
+      oldBox.replaceChildren(...(old.length ? [
+        h("h4", { class: "section-title" }, "Topics from the first version"),
+        h("p", { class: "muted small" }, "These are no longer used. Tap one to delete it."),
+        h("div", { class: "tag-editor" }, old.map(tag => h("button", {
+          class: "tag-row", type: "button", style: `--c:${state.tags.color(tag.id)}`, onclick: () => tagActions(tag, renderTags),
+        }, h("span", { class: "dot" }), h("span", { class: "tag-name" }, state.tags.name(tag.id)), h("span", { class: "tag-count" }, count(state.tags.descendants(tag.id)))))),
+      ] : []));
     };
 
     const fmts = supportedFormats();
     el.append(
       screenHeader("Settings", close),
       h("div", { class: "screen-body" },
-        h("h4", { class: "section-title" }, "Topics"),
-        h("p", { class: "muted small" }, "Tap a topic to add a sub-topic, rename, move or delete it. The number is how many recordings use it."),
-        topicsBox,
-        h("h4", { class: "section-title" }, "Labels"),
-        labelsBox,
-        h("h4", { class: "section-title" }, "Import recordings"),
-        h("p", { class: "muted small" }, "Pick audio files from the phone (for example the Voice Recorder folder). The date and time are read from the file name; what you wrote after it becomes the title. Files already imported are skipped."),
+        h("h4", { class: "section-title" }, "Your tags"),
+        h("p", { class: "muted small" }, "Tap a tag to rename or delete it. The number is how many recordings use it."),
+        tagsBox,
+        oldBox,
+        h("h4", { class: "section-title" }, "Import old recordings"),
+        h("p", { class: "muted small" }, "Pick audio files from the phone (for example the Voice Recorder folder) — you can select them all at once. The date and time are read from the file name; what you wrote after it becomes the title. Files already imported are skipped."),
         btn("Choose files…", () => $("#import-input").click(), "wide primary"),
         h("h4", { class: "section-title" }, "Phone storage"),
         storageBox,
@@ -1232,41 +1244,20 @@ async function showStorage(box) {
 }
 
 function tagActions(tag, rerender) {
-  const isTopic = tag.kind === "topic";
   openSheet((s, close) => {
-    s.append(
-      h("h3", {}, isTopic ? state.tags.pathName(tag.id) : "#" + tag.name),
+    fill(s,
+      h("h3", {}, state.tags.name(tag.id)),
       h("div", { class: "sheet-actions col" },
-        isTopic ? btn("+ Add a sub-topic", async () => {
-          close();
-          const name = await promptSheet({ title: `New topic under “${state.tags.pathName(tag.id)}”` });
-          if (name) { await createTag({ kind: "topic", name, parentId: tag.id }); rerender(); }
-        }) : null,
         btn("Rename", async () => {
           close();
           const name = await promptSheet({ title: "Rename", value: tag.name });
-          if (name) { tag.name = name; await db.put("tags", tag); state.tags.set(state.tags.list); rerender(); }
+          if (!name) return;
+          const old = tag.name;
+          tag.name = name;
+          try { await db.put("tags", tag); } catch (err) { tag.name = old; toast("Could not save: " + err.message); }
+          rerender();
         }),
-        isTopic ? btn("Move under another topic", async () => {
-          close();
-          const exclude = state.tags.descendants(tag.id);
-          const target = await pickTopic({ title: `Move “${tag.name}” under…`, exclude, topLevelOption: "Make it a main topic" });
-          if (target === undefined) return;
-          tag.parentId = target;
-          if (!target && !tag.color) tag.color = COLORS[state.tags.roots().length % COLORS.length];
-          tag.order = Date.now();
-          await db.put("tags", tag);
-          state.tags.set(state.tags.list);
-          rerender();
-        }) : null,
-        isTopic && !tag.parentId ? btn("Change colour", async () => {
-          tag.color = COLORS[(COLORS.indexOf(tag.color) + 1) % COLORS.length];
-          await db.put("tags", tag);
-          state.tags.set(state.tags.list);
-          rerender();
-          close();
-        }) : null,
-        btn("Delete…", async () => { close(); deleteTag(tag, rerender); }, "quiet danger-text"),
+        btn("Delete…", () => { close(); deleteTag(tag, rerender); }, "quiet danger-text"),
         btn("Cancel", close)));
   });
 }
@@ -1275,29 +1266,26 @@ async function deleteTag(tag, rerender) {
   const isTopic = tag.kind === "topic";
   const ids = isTopic ? state.tags.descendants(tag.id) : new Set([tag.id]);
   const parent = isTopic && tag.parentId ? state.tags.get(tag.parentId) : null;
-  const affected = state.recs.filter(r =>
-    (r.topics || []).some(i => ids.has(i)) || (r.marks || []).some(m => ids.has(m.tag)) || (r.labels || []).some(i => ids.has(i)));
+  const affected = state.recs.filter(r => usesAny(r, ids));
   const lockedCount = affected.filter(r => r.lock).length;
-  const sub = ids.size - 1;
   const lines = [];
-  if (sub) lines.push(`Its ${sub} sub-topic${sub > 1 ? "s are" : " is"} deleted too.`);
+  if (ids.size > 1) lines.push(`The ${ids.size - 1} under it ${ids.size > 2 ? "are" : "is"} deleted too.`);
   lines.push(`Used in ${affected.length} recording${affected.length === 1 ? "" : "s"}${lockedCount ? ` (${lockedCount} locked)` : ""}. The recordings themselves stay.`);
   if (affected.length) {
-    lines.push(!isTopic
-      ? "They just lose this label."
-      : parent
-        ? `Parts tagged with it become “${state.tags.pathName(parent.id)}”.`
-        : "Parts tagged with it lose their time mark.");
+    lines.push(!isTopic ? "Its points are removed from their timelines."
+      : parent ? `Parts marked with it become “${state.tags.name(parent.id)}”.`
+      : "Parts marked with it are removed from the timelines.");
   }
   const ok = await confirmSheet({
-    title: `Delete ${isTopic ? "“" + state.tags.pathName(tag.id) + "”" : "#" + tag.name}?`,
+    title: `Delete “${state.tags.name(tag.id)}”?`,
     body: h("div", {}, lines.map(l => h("p", { class: "muted" }, l))),
     ok: "Delete", danger: true,
   });
   if (!ok) return;
   for (const r of affected) {
-    if (r.topics) r.topics = [...new Set(r.topics.map(i => (ids.has(i) ? parent?.id : i)).filter(Boolean))];
     if (r.marks) r.marks = r.marks.filter(m => !ids.has(m.tag) || parent).map(m => (ids.has(m.tag) ? { ...m, tag: parent.id } : m));
+    if (r.topics) r.topics = [...new Set(r.topics.map(i => (ids.has(i) ? parent?.id : i)).filter(Boolean))];
+    if (r.points) r.points = r.points.filter(p => !ids.has(p.tag));
     if (r.labels) r.labels = r.labels.filter(i => !ids.has(i));
     r.updatedAt = Date.now();
   }
@@ -1308,8 +1296,7 @@ async function deleteTag(tag, rerender) {
     toast("Could not delete: " + err.message);
   }
   state.tags.set(state.tags.list.filter(t => !ids.has(t.id)));
-  state.filter.tags = state.filter.tags.filter(id => !ids.has(id));
-  state.filter.labels = state.filter.labels.filter(id => !ids.has(id));
+  state.filter.ids = state.filter.ids.filter(id => !ids.has(id));
   rerender();
 }
 
@@ -1330,9 +1317,14 @@ async function init() {
     await db.openDB();
     const meta = await db.get("meta", "schema");
     if (meta && meta.version > db.DATA_VERSION) db.setReadOnly(true);
-    else if (!meta) await db.put("meta", { key: "schema", version: db.DATA_VERSION, createdAt: Date.now() });
-    let tags = await db.getAll("tags");
-    if (!tags.length && !db.isReadOnly()) { tags = seedTags(); await db.putMany("tags", tags); }
+    const tags = await db.getAll("tags");
+    if (!db.isReadOnly()) {
+      const changed = upgradeTags(tags);
+      if (changed.length) await db.putMany("tags", changed);
+      if (!meta || meta.version < db.DATA_VERSION) {
+        await db.put("meta", { ...(meta || { key: "schema", createdAt: Date.now() }), version: db.DATA_VERSION });
+      }
+    }
     state.tags.set(tags);
     state.recs = await db.getAll("recordings");
     await recoverInterrupted();

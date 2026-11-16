@@ -11,7 +11,7 @@ const DB_VERSION = 1;
 
 // Bump when the saved data changes shape. An older app that finds newer data
 // refuses to write instead of damaging it.
-export const DATA_VERSION = 1;
+export const DATA_VERSION = 2;
 
 let dbPromise = null;
 let readOnly = false;
