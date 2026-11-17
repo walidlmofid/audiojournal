@@ -1,23 +1,29 @@
-// Everything is stored on the phone in IndexedDB.
+// The app's own storage inside the browser (IndexedDB).
 //   recordings : one small record per recording (date, title, tags, lock...)
-//   audio      : the sound itself, kept apart so the list loads fast
+//   audio      : the sound of recordings that are not (yet) files in the
+//                phone folder — see folder.js
 //   chunks     : pieces of a recording in progress, saved every few seconds,
 //                so nothing is lost if the app is closed while recording
-//   tags       : topics (a tree) and labels (a flat list)
-//   meta       : data version and small settings
+//   tags       : B / I and the tags you wrote
+//   meta       : data version and small settings (microphone, chosen folder)
 
 const DB_NAME = "audio-journal";
 const DB_VERSION = 1;
 
 // Bump when the saved data changes shape. An older app that finds newer data
 // refuses to write instead of damaging it.
-export const DATA_VERSION = 2;
+export const DATA_VERSION = 3;
 
 let dbPromise = null;
 let readOnly = false;
+let onWrite = null;
 
 export function setReadOnly(v) { readOnly = v; }
 export function isReadOnly() { return readOnly; }
+
+// fn(store) is called after every change, so the app can copy it elsewhere.
+export function setOnWrite(fn) { onWrite = fn; }
+function wrote(store) { try { onWrite?.(store); } catch { /* never blocks saving */ } }
 
 function guard() {
   if (readOnly) throw new Error("This data was saved by a newer version of the app. Reload the app to update it.");
@@ -73,7 +79,8 @@ export async function put(store, value) {
   const db = await openDB();
   const tx = db.transaction(store, "readwrite");
   tx.objectStore(store).put(value);
-  return done(tx);
+  await done(tx);
+  wrote(store);
 }
 
 export async function putMany(store, values) {
@@ -81,7 +88,8 @@ export async function putMany(store, values) {
   const db = await openDB();
   const tx = db.transaction(store, "readwrite");
   for (const v of values) tx.objectStore(store).put(v);
-  return done(tx);
+  await done(tx);
+  wrote(store);
 }
 
 export async function del(store, key) {
@@ -89,7 +97,8 @@ export async function del(store, key) {
   const db = await openDB();
   const tx = db.transaction(store, "readwrite");
   tx.objectStore(store).delete(key);
-  return done(tx);
+  await done(tx);
+  wrote(store);
 }
 
 // A copy without functions/undefined, safe to store.
@@ -133,6 +142,7 @@ export async function finishRecording(rec) {
   tx.objectStore("recordings").put(plain(rec));
   tx.objectStore("chunks").delete(chunkRange(rec.id));
   await done(tx);
+  wrote("recordings");
   return rec;
 }
 
@@ -142,12 +152,26 @@ export async function addImported(rec, blob) {
   const tx = db.transaction(["audio", "recordings"], "readwrite");
   tx.objectStore("audio").put({ id: rec.id, blob });
   tx.objectStore("recordings").put(plain(rec));
-  return done(tx);
+  await done(tx);
+  wrote("recordings");
 }
 
 export async function getAudio(id) {
   const row = await get("audio", id);
   return row ? row.blob : null;
+}
+
+// The recording's audio now lives in the phone folder (rec.file): remember
+// that and drop the copy kept here, in a single step.
+export async function linkFile(rec) {
+  guard();
+  const db = await openDB();
+  rec.updatedAt = Date.now();
+  const tx = db.transaction(["audio", "recordings"], "readwrite");
+  tx.objectStore("recordings").put(plain(rec));
+  tx.objectStore("audio").delete(rec.id);
+  await done(tx);
+  wrote("recordings");
 }
 
 export async function deleteRecording(id) {
@@ -157,7 +181,8 @@ export async function deleteRecording(id) {
   tx.objectStore("audio").delete(id);
   tx.objectStore("recordings").delete(id);
   tx.objectStore("chunks").delete(chunkRange(id));
-  return done(tx);
+  await done(tx);
+  wrote("recordings");
 }
 
 export async function saveRecording(rec) {

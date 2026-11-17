@@ -1,13 +1,16 @@
-import { h, $, uid, fmtClock, fmtLength, dayKey, fmtTime, fmtDay, fmtDayShort, fmtISODate, todayISO, fmtBytes, fold, icons } from "./util.js";
+import { h, $, uid, pad, fmtClock, fmtLength, dayKey, fmtTime, fmtDay, fmtDayShort, fmtISODate, todayISO, fmtBytes, fold, icons } from "./util.js";
 import * as db from "./db.js";
 import { Recorder, supportedFormats, listMics } from "./recorder.js";
 import { Tags, upgradeTags } from "./tags.js";
+import * as folder from "./folder.js";
 
-const APP_VERSION = "0.3.0";
+const APP_VERSION = "0.4.0";
 
 // A recording looks like this:
 //   marks  : [{ t, tag }]  parts — "B" or "I" from second t until the next mark
 //   points : [{ t, tag }]  tags — a single point at second t
+//   file   : name of its audio file in the phone folder; when missing, the
+//            audio is still kept inside the browser (see "The phone folder")
 // (topics / labels are whole-recording tags from the first version; they are
 //  still shown and searched, and can be removed in edit mode.)
 
@@ -344,6 +347,12 @@ function renderBanner() {
     el.hidden = false;
     return;
   }
+  if (folder.chosen() && !folder.ready()) {
+    el.append(h("span", {}, `📁 Your recordings folder “${folder.name()}” is closed.`),
+      btn("Open", connectFolder, "primary small"));
+    el.hidden = false;
+    return;
+  }
   const due = state.recs.filter(isDue);
   if (due.length) {
     el.append(h("span", {}, `🔓 ${due.length} locked recording${due.length > 1 ? "s have" : " has"} reached the unlock date.`),
@@ -653,7 +662,13 @@ async function openDetail(id, { edit = false, focus = null } = {}) {
   if (!r) return;
   if (r.lock) { openLocked(r); return; }
 
-  const blob = await db.getAudio(id).catch(() => null);
+  // The audio is a file in the phone folder, or still inside the browser.
+  let blob = null, missing = "";
+  if (r.file && !folder.ready()) missing = "folder";
+  else {
+    try { blob = r.file ? await folder.read(r.file) : await db.getAudio(id); } catch { blob = null; }
+    if (!blob) missing = r.file ? "file" : "audio";
+  }
   const url = blob ? URL.createObjectURL(blob) : null;
   const audio = new Audio();
   audio.preload = "metadata";
@@ -779,9 +794,11 @@ async function openDetail(id, { edit = false, focus = null } = {}) {
     note.addEventListener("input", () => { r.note = note.value; saveSoon(); });
 
     const info = [
-      r.source === "import" ? `Imported from “${r.originalName}”` : r.recovered ? "Recorded in this app (recovered after an interruption)" : "Recorded in this app",
+      r.source === "import" ? `Imported from “${r.originalName}”` : r.source === "folder" ? "Found in the folder"
+        : r.recovered ? "Recorded in this app (recovered after an interruption)" : "Recorded in this app",
       (r.ext || "").toUpperCase(),
       fmtBytes(r.size),
+      r.file ? `File “${r.file}” in the folder “${folder.name()}”` : "Kept inside Chrome, not a file yet",
     ].filter(Boolean).join(" · ");
 
     const player = h("div", { class: "player" },
@@ -811,7 +828,13 @@ async function openDetail(id, { edit = false, focus = null } = {}) {
         h("div", { class: "screen-body" },
           editing ? h("div", { class: "edit-strip" }, "Editing · changes are saved as you make them") : null,
           editing ? title : h("h2", { class: "title-text" + (r.title ? "" : " muted") }, r.title || "Untitled"),
-          !url ? h("p", { class: "warn" }, "The audio for this recording is missing on this phone.") : null,
+          missing === "folder" ? h("div", { class: "warn-box" },
+            h("p", {}, `This recording is a file in your folder “${folder.name()}”. Open the folder to play it.`),
+            btn("Open the folder", async () => {
+              if (await connectFolder()) { close(); openDetail(id, { edit: editing, focus }); }
+            }, "primary small"))
+          : missing === "file" ? h("p", { class: "warn" }, `The file “${r.file}” was not found in the folder “${folder.name()}”.`)
+          : missing ? h("p", { class: "warn" }, "The audio for this recording is missing on this phone.") : null,
           player,
           editing ? [section("Tap at the moment it starts"), pad.el] : null,
           section("Timeline"),
@@ -849,13 +872,15 @@ async function openDetail(id, { edit = false, focus = null } = {}) {
 }
 
 async function deleteRec(r, closeDetail) {
+  if (r.file && !folder.ready()) { toast(`Open the folder “${folder.name()}” first, so its file can be deleted too.`, 5000); return; }
   const what = `${fmtDay(r.startedAt)} at ${fmtTime(r.startedAt)} · ${fmtLength(r.durationSec)}${r.title ? ` · “${r.title}”` : ""}`;
-  const where = r.source === "import"
-    ? "It is removed from this app. The original file stays in your phone's recorder app."
-    : "This is the only copy — it is not backed up anywhere yet.";
+  const where = r.file ? `The file “${r.file}” is deleted from the folder “${folder.name()}”. It can't be brought back.`
+    : r.source === "import" ? "It is removed from this app. The original file stays in your phone's recorder app."
+    : "This is the only copy.";
   const ok = await confirmSheet({ title: "Delete this recording?", body: h("div", {}, h("p", {}, what), h("p", { class: "muted" }, where)), ok: "Delete", danger: true });
   if (!ok) return;
   try {
+    if (r.file) await folder.remove(r.file).catch(err => { if (err.name !== "NotFoundError") throw err; });
     await db.deleteRecording(r.id);
     state.recs = state.recs.filter(x => x !== r);
     closeDetail();
@@ -876,7 +901,7 @@ async function startRecording() {
 
   const now = Date.now();
   const rec = {
-    id: uid(), v: 2, startedAt: now, durationSec: 0, mimeType: "", ext: "", size: 0,
+    id: uid(), v: 3, startedAt: now, durationSec: 0, mimeType: "", ext: "", size: 0,
     title: "", note: "", marks: [], points: [], lock: null,
     source: "app", status: "recording", createdAt: now, updatedAt: now,
   };
@@ -975,6 +1000,8 @@ async function keepAwake(session) {
 document.addEventListener("visibilitychange", () => {
   const s = state.recording;
   if (s && !s.stopping && document.visibilityState === "visible") keepAwake(s);
+  // Leaving the app: write the latest tags to the folder now.
+  if (document.visibilityState === "hidden" && mirrorTimer) mirror();
 });
 
 window.addEventListener("beforeunload", e => {
@@ -1047,8 +1074,15 @@ function afterRecording(r, reason) {
         r.title = title.value.trim();
         try { await db.saveRecording(r); } catch (err) { toast("Could not save the title: " + err.message); }
       }
+      let msg = "Saved ✓";
+      if (folder.ready()) {
+        try { if (await moveToFolder(r)) msg = `Saved in “${folder.name()}” ✓`; }
+        catch (err) { msg = "Saved inside Chrome — it could not be written to the folder: " + err.message; }
+      } else if (folder.chosen()) {
+        msg = "Saved ✓ It goes into your folder the next time the folder is open.";
+      }
       renderAll();
-      toast("Saved on this phone ✓");
+      toast(msg, 5000);
     },
   });
 }
@@ -1068,6 +1102,240 @@ async function recoverInterrupted() {
 }
 
 /* ------------------------------------------------------------------ */
+/* The phone folder                                                    */
+/* ------------------------------------------------------------------ */
+
+// Recordings are normal audio files in a folder the user picked, next to one
+// file, journal.json, that holds the tags and timelines. A recording made
+// while the folder is closed waits inside the browser and is moved later.
+
+const JOURNAL = "journal.json";
+let journalChecked = false;   // an existing journal.json is never overwritten before it was looked at
+let folderBusy = false;
+let mirrorTimer = 0;
+let mirrorChain = Promise.resolve();
+
+const inChrome = () => state.recs.filter(r => !r.file && r.status !== "recording");
+
+function fileNameFor(r) {
+  if (r.originalName) return r.originalName;
+  const d = new Date(r.startedAt);
+  return `${dayKey(r.startedAt)}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}.${r.ext || "m4a"}`;
+}
+
+// Writes one recording into the folder as a normal file, checks the file is
+// complete, and only then removes the copy kept inside the browser.
+async function moveToFolder(r) {
+  if (!folder.ready() || r.file || r.status === "recording") return false;
+  const blob = await db.getAudio(r.id);
+  if (!blob) return false;
+  // An imported file that is already in the folder (same name, same size) is not written twice.
+  const already = r.originalName && (await folder.sizeOf(r.originalName)) === blob.size;
+  const name = already ? r.originalName : await folder.write(await folder.freeName(fileNameFor(r)), blob);
+  r.file = name;
+  try { await db.linkFile(r); } catch (err) { delete r.file; throw err; }
+  return true;
+}
+
+// Runs fn on each item; shows progress (and a Stop button) when there are many.
+async function eachWithProgress(title, items, label, fn) {
+  let stop = false, sheet = null;
+  const text = h("p", { class: "small" }, "");
+  const bar = h("div", { class: "meter" }, h("div", { class: "meter-fill" }));
+  if (items.length > 2) {
+    openSheet((s, close) => {
+      sheet = { close };
+      fill(s, h("h3", {}, title), h("p", { class: "muted small" }, "Keep the app open until it finishes."), text, bar,
+        h("div", { class: "sheet-actions" }, btn("Stop", () => { stop = true; })));
+    });
+  }
+  for (let i = 0; i < items.length && !stop; i++) {
+    text.textContent = `${i + 1} of ${items.length}: ${label(items[i])}`;
+    bar.firstChild.style.width = `${((i + 1) / items.length) * 100}%`;
+    await fn(items[i]);
+  }
+  sheet?.close();
+}
+
+async function movePending() {
+  let moved = 0;
+  const failed = [];
+  await eachWithProgress("Moving recordings into the folder", inChrome(), fileNameFor, async r => {
+    try { if (await moveToFolder(r)) moved++; } catch (err) { failed.push(err.message); }
+  });
+  if (failed.length) toast(`${failed.length} could not be moved and stay inside Chrome: ${failed[0]}`, 8000);
+  return moved;
+}
+
+// Audio files that are in the folder but not in the app yet are added.
+async function scanFolder() {
+  const known = new Set(state.recs.map(r => r.file).filter(Boolean));
+  let names;
+  try { names = (await folder.list()).filter(n => AUDIO_EXT.test(n) && !n.startsWith(".") && !known.has(n)).sort(); } catch { return 0; }
+  let added = 0;
+  await eachWithProgress("Adding the recordings found in the folder", names, n => n, async n => {
+    try {
+      const rec = await recFromFile(await folder.read(n), n);
+      rec.file = n;
+      rec.source = "folder";
+      await db.put("recordings", rec);
+      state.recs.push(rec);
+      added++;
+    } catch { /* unreadable file: left alone */ }
+  });
+  return added;
+}
+
+// A folder that already holds a journal (the browser's data was cleared, a
+// new phone, another folder...): recordings in it that the app doesn't know
+// are brought in with their tags, so journal.json never loses anything when
+// it is next written. Returns false if the folder must not be written to.
+async function checkJournal() {
+  const text = await folder.readText(JOURNAL);
+  if (!text) return true;
+  let j;
+  try { j = JSON.parse(text); } catch { return true; }
+  if (j.version > db.DATA_VERSION) {
+    await confirmSheet({ title: "This folder was used by a newer version of the app", body: "Reload the app to update it, then open the folder again.", ok: "OK", cancel: null });
+    return false;
+  }
+  const ids = new Set(state.recs.map(r => r.id));
+  const files = new Set(state.recs.map(r => r.file).filter(Boolean));
+  const extra = (j.recordings || []).filter(r => r && r.id && r.file && !ids.has(r.id) && !files.has(r.file));
+  if (!extra.length) return true;
+  const ok = await confirmSheet({
+    title: "Bring back your journal?",
+    body: `This folder holds a journal with ${extra.length} recording${extra.length === 1 ? "" : "s"} and their tags that ${extra.length === 1 ? "is" : "are"} not in the app, last saved ${fmtDayShort(Date.parse(j.savedAt) || Date.now())}.`,
+    ok: "Bring it back", cancel: "No, leave it out",
+  });
+  if (!ok) {
+    // journal.json will be replaced: keep the old one under another name.
+    await folder.write(await folder.freeName(`journal (kept ${todayISO()}).json`), text);
+    return true;
+  }
+  // The journal's tags: one that the app already has under the same name
+  // (B, I, just_chatting...) is matched to it; the others are added.
+  const swap = new Map();
+  const fresh = [];
+  for (const t of Array.isArray(j.tags) ? j.tags : []) {
+    if (!t || !t.id || state.tags.get(t.id)) continue;
+    const twin = t.parentId ? null : state.tags.list.find(m => m.kind === t.kind && !m.parentId && fold(m.name) === fold(t.name));
+    if (twin) swap.set(t.id, twin.id); else fresh.push(t);
+  }
+  const mine = id => swap.get(id) || id;
+  for (const t of fresh) if (t.parentId) t.parentId = mine(t.parentId);
+  for (const r of extra) {
+    if (r.marks) r.marks = r.marks.map(m => ({ ...m, tag: mine(m.tag) }));
+    if (r.points) r.points = r.points.map(p => ({ ...p, tag: mine(p.tag) }));
+    if (r.topics) r.topics = r.topics.map(mine);
+    if (r.labels) r.labels = r.labels.map(mine);
+  }
+  if (fresh.length) await db.putMany("tags", fresh);
+  await db.putMany("recordings", extra);
+  state.tags.set([...state.tags.list, ...fresh]);
+  state.recs.push(...extra);
+  return true;
+}
+
+// journal.json: everything except the sound, readable without this app.
+function mirrorSoon() {
+  if (!journalChecked || !folder.ready()) return;
+  clearTimeout(mirrorTimer);
+  mirrorTimer = setTimeout(mirror, 1500);
+}
+
+function mirror() {
+  clearTimeout(mirrorTimer);
+  mirrorTimer = 0;
+  mirrorChain = mirrorChain.then(async () => {
+    if (!journalChecked || !folder.ready() || db.isReadOnly()) return;
+    const data = {
+      app: "Audio Journal",
+      about: "One entry per recording. file = its audio file in this folder. marks = parts: from second t until the next mark, tag = id of B or I. points = tags placed at second t. The names of the tag ids are in 'tags'.",
+      version: db.DATA_VERSION,
+      savedAt: new Date().toISOString(),
+      tags: state.tags.list,
+      recordings: state.recs.filter(r => r.status !== "recording"),
+    };
+    try { await folder.write(JOURNAL, JSON.stringify(data, null, 1)); } catch { /* written again at the next change */ }
+  });
+  return mirrorChain;
+}
+
+// Everything that happens once the folder can be used.
+async function afterConnect() {
+  if (folderBusy || !folder.ready() || db.isReadOnly()) return;
+  folderBusy = true;
+  try {
+    // From here on recordings are files in the folder: older versions of the
+    // app don't know that, so the saved data is marked as newer than them.
+    const meta = await db.get("meta", "schema");
+    if (meta && meta.version < db.DATA_VERSION) await db.put("meta", { ...meta, version: db.DATA_VERSION });
+    if (!journalChecked) {
+      if (!(await checkJournal())) return;
+      journalChecked = true;
+    }
+    const moved = await movePending();
+    const added = await scanFolder();
+    const news = [moved ? `${moved} moved into the folder` : "", added ? `${added} found in the folder and added` : ""].filter(Boolean);
+    if (news.length) toast(news.join(" · ") + ".", 6000);
+    await mirror();
+    return moved + added;
+  } catch (err) {
+    toast("Problem with the folder: " + err.message, 6000);
+  } finally {
+    folderBusy = false;
+    renderAll();
+  }
+}
+
+// Opens the remembered folder again. Some phones forget it; then it has to
+// be picked again.
+async function connectFolder() {
+  if (!(await folder.reconnect())) {
+    const ok = await confirmSheet({
+      title: "Pick the folder again",
+      body: `The phone didn't give access to “${folder.name()}”. Pick the same folder again.`,
+      ok: "Pick the folder",
+    });
+    if (!ok) return false;
+    try { await folder.pick(); } catch (err) { if (err.name !== "AbortError") toast("Can't use that folder: " + err.message, 6000); }
+    if (!folder.ready()) { renderAll(); return false; }
+    journalChecked = false;
+  }
+  await afterConnect();
+  return folder.ready();
+}
+
+async function chooseFolder() {
+  if (db.isReadOnly()) return;
+  const waiting = inChrome().length;
+  const ok = await confirmSheet({
+    title: "Save recordings in a phone folder",
+    body: h("div", {},
+      h("p", {}, "Pick or create a folder, for example “Audio Journal”. Every recording becomes a normal audio file in it, plus one small file, journal.json, with your tags."),
+      waiting ? h("p", {}, `The ${waiting} recording${waiting === 1 ? "" : "s"} now inside Chrome ${waiting === 1 ? "is" : "are"} moved there. Each one is removed from Chrome only after its file is checked.`) : null,
+      h("p", { class: "muted" }, "Audio files already in that folder are added to the app.")),
+    ok: "Pick a folder",
+  });
+  if (!ok) return;
+  try { await folder.pick(); } catch (err) { if (err.name !== "AbortError") toast("Can't use that folder: " + err.message, 6000); return; }
+  if (!folder.ready()) { toast("The phone didn't give access to that folder."); renderAll(); return; }
+  journalChecked = false;
+  await afterConnect();
+  if (!folder.ready()) return;
+  const names = new Set(await folder.list().catch(() => []));
+  const lost = state.recs.filter(r => r.file && !names.has(r.file)).length;
+  if (lost) {
+    await confirmSheet({
+      title: `${lost} recording${lost === 1 ? " is" : "s are"} not in this folder`,
+      body: "Their files were not found here. If this is not the folder you used before, choose the right one in Settings.",
+      ok: "OK", cancel: null,
+    });
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Import                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -1075,7 +1343,7 @@ const AUDIO_EXT = /\.(m4a|mp4|aac|mp3|wav|ogg|oga|opus|webm|amr|3gp|flac)$/i;
 
 // "Voice 260915_133741 printfy.m4a" -> 15 Sep 2026 13:37:41
 function dateFromName(name) {
-  let m = name.match(/(20\d{2})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})/);
+  let m = name.match(/(20\d{2})-?(\d{2})-?(\d{2})[_ -](\d{2})-?(\d{2})-?(\d{2})/);
   let y, mo, d, hh, mi, ss;
   if (m) [, y, mo, d, hh, mi, ss] = m.map(Number);
   else {
@@ -1118,6 +1386,26 @@ function probeDuration(blob) {
   });
 }
 
+// The app's record for an audio file that already exists (import, or a file
+// found in the folder).
+async function recFromFile(f, fileName) {
+  const fromName = dateFromName(fileName);
+  const now = Date.now();
+  return {
+    id: uid(), v: 3,
+    startedAt: fromName ?? f.lastModified,
+    dateFrom: fromName ? "file name" : "file date",
+    durationSec: await probeDuration(f),
+    mimeType: f.type || "audio/" + (fileName.split(".").pop() || "").toLowerCase(),
+    ext: (fileName.match(/\.(\w+)$/)?.[1] || "").toLowerCase(),
+    size: f.size,
+    title: titleFromName(fileName), note: "",
+    marks: [], points: [], lock: null,
+    source: "import", originalName: fileName, status: "saved",
+    createdAt: now, updatedAt: now,
+  };
+}
+
 async function importFiles(fileList) {
   if (db.isReadOnly()) return;
   const files = [...fileList].filter(f => f.type.startsWith("audio/") || AUDIO_EXT.test(f.name));
@@ -1141,21 +1429,7 @@ async function importFiles(fileList) {
     progressText.textContent = `${i + 1} of ${files.length}: ${f.name}`;
     bar.firstChild.style.width = `${((i + 1) / files.length) * 100}%`;
     if (known.has(`${f.name}|${f.size}`)) { skipped++; continue; }
-    const fromName = dateFromName(f.name);
-    const now = Date.now();
-    const rec = {
-      id: uid(), v: 2,
-      startedAt: fromName ?? f.lastModified,
-      dateFrom: fromName ? "file name" : "file date",
-      durationSec: await probeDuration(f),
-      mimeType: f.type || "audio/" + (f.name.split(".").pop() || "").toLowerCase(),
-      ext: (f.name.match(/\.(\w+)$/)?.[1] || "").toLowerCase(),
-      size: f.size,
-      title: titleFromName(f.name), note: "",
-      marks: [], points: [], lock: null,
-      source: "import", originalName: f.name, status: "saved",
-      createdAt: now, updatedAt: now,
-    };
+    const rec = await recFromFile(f, f.name);
     try {
       await db.addImported(rec, f);
       state.recs.push(rec);
@@ -1164,6 +1438,10 @@ async function importFiles(fileList) {
     } catch (err) {
       failed.push(f.name);
       if (err.name === "QuotaExceededError") { stopReason = "The phone storage is full."; break; }
+      continue;
+    }
+    if (folder.ready()) {
+      try { await moveToFolder(rec); } catch { /* stays inside Chrome; tried again when the folder is next opened */ }
     }
   }
   sheet.close();
@@ -1221,6 +1499,28 @@ function openSettings() {
     const tagsBox = h("div", { class: "tag-editor" });
     const oldBox = h("div");
     const storageBox = h("div", { class: "muted small" }, "…");
+    const folderBox = h("div");
+    const renderFolder = () => {
+      const waiting = inChrome().length, files = state.recs.filter(r => r.file).length;
+      const again = fn => async () => { await fn(); renderFolder(); showStorage(storageBox); };
+      const p = text => h("p", { class: "muted small" }, text);
+      if (!folder.supported()) {
+        folderBox.replaceChildren(p("Inside Chrome's hidden storage. This browser can't save into a phone folder — update Chrome and open the app from Chrome."));
+      } else if (!folder.chosen()) {
+        folderBox.replaceChildren(
+          p(`Inside Chrome's hidden storage (${waiting} recording${waiting === 1 ? "" : "s"}). They can't be seen as files, and clearing Chrome's data would delete them.`),
+          btn("Save in a phone folder…", again(chooseFolder), "wide primary"));
+      } else {
+        folderBox.replaceChildren();
+        fill(folderBox,
+          p(`Folder “${folder.name()}” — ${folder.ready() ? "open" : "closed right now"}. ${files} recording${files === 1 ? " is a file" : "s are files"} in it.`),
+          waiting ? p(`${waiting} still inside Chrome${folder.ready() ? "." : "; they move when the folder is opened."}`) : null,
+          folder.ready()
+            ? btn("Look for new files in the folder", again(async () => { if ((await afterConnect()) === 0) toast("Nothing new in the folder."); }), "wide")
+            : btn("Open the folder", again(connectFolder), "wide primary"),
+          btn("Choose another folder…", again(chooseFolder), "wide quiet"));
+      }
+    };
     const micBox = h("div");
     const renderMic = () => micBox.replaceChildren(
       h("p", { class: "muted small" }, state.mic
@@ -1252,6 +1552,8 @@ function openSettings() {
         h("p", { class: "muted small" }, "Tap a tag to rename or delete it. The number is how many recordings use it."),
         tagsBox,
         oldBox,
+        h("h4", { class: "section-title" }, "Where recordings are saved"),
+        folderBox,
         h("h4", { class: "section-title" }, "Microphone"),
         micBox,
         h("h4", { class: "section-title" }, "Import old recordings"),
@@ -1266,6 +1568,7 @@ function openSettings() {
           `Version ${APP_VERSION}. New recordings are saved as ${fmts[0] || "(recording not supported in this browser)"}.`)));
     renderTags();
     renderMic();
+    renderFolder();
     showStorage(storageBox);
   }, { onClose: renderAll });
 }
@@ -1277,7 +1580,7 @@ async function showStorage(box) {
   const lines = [`${recs.length} recordings · ${fmtLength(secs)} · ${fmtBytes(bytes)}`];
   try {
     const est = await navigator.storage?.estimate?.();
-    if (est?.quota) lines.push(`Space the app may use on this phone: ${fmtBytes(est.quota)} (used ${fmtBytes(est.usage)}).`);
+    if (est?.quota) lines.push(`Inside Chrome: ${fmtBytes(est.usage)} used (it may use up to ${fmtBytes(est.quota)}).`);
     const kept = await navigator.storage?.persisted?.();
     lines.push(kept
       ? "Protected: the phone won't delete this data by itself."
@@ -1364,8 +1667,10 @@ async function init() {
     if (!db.isReadOnly()) {
       const changed = upgradeTags(tags);
       if (changed.length) await db.putMany("tags", changed);
-      if (!meta || meta.version < db.DATA_VERSION) {
-        await db.put("meta", { ...(meta || { key: "schema", createdAt: Date.now() }), version: db.DATA_VERSION });
+      // Version 3 (recordings as files in a phone folder) only starts when a
+      // folder is chosen, so updating the app changes nothing by itself.
+      if (!meta || meta.version < 2) {
+        await db.put("meta", { ...(meta || { key: "schema", createdAt: Date.now() }), version: 2 });
       }
     }
     state.tags.set(tags);
@@ -1373,6 +1678,8 @@ async function init() {
     state.mic = mic?.deviceId ? mic : null;
     state.recs = await db.getAll("recordings");
     await recoverInterrupted();
+    await folder.load();
+    db.setOnWrite(st => { if (st === "recordings" || st === "tags") mirrorSoon(); });
   } catch (err) {
     $("#list").replaceChildren(h("div", { class: "empty" }, h("p", { class: "warn" }, "The app couldn't open its storage: " + err.message)));
     return;
@@ -1390,6 +1697,8 @@ async function init() {
   $("#rec-btn").addEventListener("click", startRecording);
   bindRail();
   renderAll();
+  // The folder was left open by the phone: tidy up (move what waits, add new files).
+  if (folder.ready()) afterConnect();
 }
 
 init();
